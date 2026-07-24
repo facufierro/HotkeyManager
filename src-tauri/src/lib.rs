@@ -1631,6 +1631,13 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            // Keep the app (and thus its child AutoHotkey process tree) out of Windows
+            // Efficiency Mode while it lives in the tray, so hotkeys don't go dead after idle.
+            #[cfg(target_os = "windows")]
+            unsafe {
+                ahk::disable_power_throttling(winapi::um::processthreadsapi::GetCurrentProcess());
+            }
+
             let data_dir = app.path().app_data_dir()
                 .expect("failed to resolve app data dir");
             let scripts_dir = data_dir.join("scripts");
