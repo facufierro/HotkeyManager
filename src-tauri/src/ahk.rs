@@ -70,14 +70,33 @@ impl Drop for AhkJob {
 #[cfg(target_os = "windows")]
 fn keep_process_responsive(child: &Child) {
     use std::os::windows::io::AsRawHandle;
-    use winapi::um::processthreadsapi::{SetPriorityClass, SetProcessInformation};
+    use winapi::um::processthreadsapi::SetPriorityClass;
 
-    // Not in winapi 0.3.9: the ProcessPowerThrottling info class (4), its state struct, and
-    // ABOVE_NORMAL_PRIORITY_CLASS. Declared locally to match <winnt.h>/<winbase.h>.
+    const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x0000_8000; // not in the enabled winapi features
+
+    let handle = child.as_raw_handle() as winapi::um::winnt::HANDLE;
+    if handle.is_null() {
+        return;
+    }
+    disable_power_throttling(handle);
+    unsafe { SetPriorityClass(handle, ABOVE_NORMAL_PRIORITY_CLASS); }
+}
+
+/// Opt a process out of Windows EcoQoS "Efficiency Mode" power throttling. Idle in the tray with
+/// no visible window, Windows throttles the app — and Efficiency Mode extends across the process
+/// tree to the child AutoHotkey process that dispatches hotkeys. A throttled process's low-level
+/// keyboard hook times out and Windows drops it, leaving hotkeys dead until the process is
+/// scheduled again (a standalone AHK script, not being a throttled background child, never hits
+/// this). Applied to BOTH the AHK child and the app process itself, so the tree stays un-throttled.
+#[cfg(target_os = "windows")]
+pub fn disable_power_throttling(process: winapi::um::winnt::HANDLE) {
+    use winapi::um::processthreadsapi::SetProcessInformation;
+
+    // Not in winapi 0.3.9: the ProcessPowerThrottling info class (4) and its state struct.
+    // Declared locally to match <winnt.h>/<processthreadsapi.h>.
     const PROCESS_POWER_THROTTLING: u32 = 4;
     const PROCESS_POWER_THROTTLING_CURRENT_VERSION: u32 = 1;
     const PROCESS_POWER_THROTTLING_EXECUTION_SPEED: u32 = 0x1;
-    const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x0000_8000;
 
     #[repr(C)]
     struct ProcessPowerThrottlingState {
@@ -86,8 +105,7 @@ fn keep_process_responsive(child: &Child) {
         state_mask: u32,
     }
 
-    let handle = child.as_raw_handle() as winapi::um::winnt::HANDLE;
-    if handle.is_null() {
+    if process.is_null() {
         return;
     }
     unsafe {
@@ -98,12 +116,11 @@ fn keep_process_responsive(child: &Child) {
             state_mask: 0,
         };
         SetProcessInformation(
-            handle,
+            process,
             PROCESS_POWER_THROTTLING,
             &mut state as *mut _ as *mut winapi::ctypes::c_void,
             std::mem::size_of::<ProcessPowerThrottlingState>() as u32,
         );
-        SetPriorityClass(handle, ABOVE_NORMAL_PRIORITY_CLASS);
     }
 }
 
@@ -121,6 +138,7 @@ pub const COPILOT_FIX_SCRIPT: &str = r#"#Requires AutoHotkey v2.0
 
 global state := "idle"
 global shiftSuppressed := false
+global rctrlHeld := false
 
 ; LWin: intercept and hold briefly to see whether the Copilot key's F23 follows.
 $*LWin::{
@@ -180,19 +198,28 @@ PassKeys() {
     }
 }
 
-; F23 (scancode SC06E) = the Copilot key -> hold Right Ctrl.
+; F23 (scancode SC06E) = the Copilot key -> hold Right Ctrl. Holding the key makes Windows
+; auto-repeat SC06E; re-sending "{RCtrl down}" on every repeat made RCtrl register dozens of
+; presses. Track it with rctrlHeld so the down is sent once, and release on the key's own up
+; regardless of `state` so a state clobbered mid-hold can never leave RCtrl stuck down (a stuck
+; RCtrl silently turns every other hotkey into a Ctrl+ combo).
 $*SC06E::{
-    global state, shiftSuppressed
+    global state, shiftSuppressed, rctrlHeld
     SetTimer(PassKeys, 0)
     state := "copilot"
     shiftSuppressed := false
+    if rctrlHeld
+        return
+    rctrlHeld := true
     SendInput "{RCtrl down}"
 }
 
 $*SC06E up::{
-    global state
-    if state = "copilot" {
+    global state, rctrlHeld
+    if state = "copilot"
         state := "idle"
+    if rctrlHeld {
+        rctrlHeld := false
         SendInput "{RCtrl up}"
     }
 }
@@ -200,6 +227,8 @@ $*SC06E up::{
 ; Safety: release everything if this script exits cleanly.
 OnExit(ReleaseHeld)
 ReleaseHeld(*) {
+    global rctrlHeld
+    rctrlHeld := false
     SendInput "{RCtrl up}{LWin up}{LShift up}"
 }
 "#;
@@ -558,6 +587,7 @@ SyncOverlay()
 InstallKeybdHook true, true
 InstallMouseHook true, true
 global lastHookReinstall := 0
+global lastHealthTick := A_TickCount
 
 ReinstallHooks() {{
     global lastHookReinstall
@@ -575,7 +605,17 @@ OnPowerBroadcast(wParam, lParam, msg, hwnd) {{
 }}
 
 CheckHookHealth(*) {{
-    global lastHookReinstall
+    global lastHookReinstall, lastHealthTick
+    ; This 1-second timer firing far late means the process was throttled or suspended (idle in
+    ; the tray under Efficiency Mode, or a real sleep). Windows drops the low-level hooks in that
+    ; state, so reinstall them the instant we run again — this is what makes hotkeys recover
+    ; promptly after idle instead of staying dead until the idle heuristic below finally trips.
+    gap := A_TickCount - lastHealthTick
+    lastHealthTick := A_TickCount
+    if (gap > 3000) {{
+        ReinstallHooks()
+        return
+    }}
     ; A_TimeIdle is the OS-wide idle time (GetLastInputInfo); A_TimeIdleKeyboard is
     ; how long this script's keyboard hook has gone without a keystroke. If the OS
     ; just registered input but the keyboard hook has been silent far longer, Windows
