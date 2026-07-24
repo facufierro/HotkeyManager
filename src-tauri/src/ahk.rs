@@ -136,6 +136,11 @@ const DEFAULT_REPEAT_HOLD_MS: u64 = 6;
 pub const COPILOT_FIX_SCRIPT: &str = r#"#Requires AutoHotkey v2.0
 #SingleInstance Force
 
+; Holding the Copilot key makes Windows auto-repeat its scancode ~50x/sec, so this hotkey
+; fires dozens of times a second while held. Raise AHK's runaway-hotkey guard (default 70 per
+; 2s) well above that so the "N hotkeys received" warning never pops and kills the remap.
+A_MaxHotkeysPerInterval := 1000
+
 global state := "idle"
 global shiftSuppressed := false
 global rctrlHeld := false
@@ -490,6 +495,11 @@ pub fn generate_combined_script(armed: &[ArmedProfile]) -> String {
     let header = format!(
         r###"#Requires AutoHotkey v2.0
 #SingleInstance Force
+
+; A held hotkey (a hold/repeat remap, or a held accent key) auto-repeats dozens of times a
+; second, which would trip AHK's runaway-hotkey guard (default 70 per 2s) and pop a warning
+; that kills every hotkey. Raise it well above any real hold rate.
+A_MaxHotkeysPerInterval := 1000
 
 CoordMode "Pixel", "Screen"
 CoordMode "Mouse", "Screen"
