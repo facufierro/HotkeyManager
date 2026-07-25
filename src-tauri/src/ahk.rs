@@ -301,6 +301,17 @@ impl AhkManager {
             false
         }
     }
+
+    /// Re-apply the responsiveness settings (un-throttle + priority) to the running process.
+    /// The one-shot opt-out at launch doesn't hold: Windows re-applies Efficiency Mode to a
+    /// background app's whole process tree each time it drops to the tray, re-throttling this
+    /// AutoHotkey process. Called periodically so it stays exempt for as long as it runs.
+    pub fn keep_responsive(&mut self) {
+        #[cfg(target_os = "windows")]
+        if let Some(child) = self.process.as_ref() {
+            keep_process_responsive(child);
+        }
+    }
 }
 
 fn resolve_ahk_exe(configured: &str, bundled: Option<&Path>) -> String {
@@ -636,6 +647,19 @@ CheckHookHealth(*) {{
         ReinstallHooks()
 }}
 SetTimer CheckHookHealth, 1000
+
+; --- TEMP DIAGNOSTIC: liveness heartbeat, logged next to this script (ahk-heartbeat.log).
+; Consecutive lines whose A_TickCount differs by far more than 1000 mean Windows froze or
+; throttled this process while it was idle in the tray; a "started" line partway through the
+; file means the process was killed and relaunched. Lets us tell a frozen process apart from an
+; alive-but-hook-dead one. Remove once the tray-idle latency is pinned down.
+global heartbeatLog := A_ScriptDir "\ahk-heartbeat.log"
+try FileAppend "=== started A_Now=" A_Now " tick=" A_TickCount "`n", heartbeatLog
+Heartbeat() {{
+    global heartbeatLog
+    try FileAppend A_TickCount " " A_Now "`n", heartbeatLog
+}}
+SetTimer Heartbeat, 1000
 
 {repeat_up_lines}
 {blocks}
