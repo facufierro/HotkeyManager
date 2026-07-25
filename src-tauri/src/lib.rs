@@ -1581,6 +1581,19 @@ fn start_watcher(handle: tauri::AppHandle) {
             } else if !any_armed {
                 state.hotkeys_ahk.lock().unwrap().kill();
             }
+
+            // Re-assert that the app and its AutoHotkey processes stay out of Windows Efficiency
+            // Mode: the one-shot opt-out at launch doesn't hold once the app drops to the tray, so
+            // Windows re-throttles the tree and the hotkey hook goes dead after idle. Re-applying
+            // it every tick keeps the tree exempt for as long as the app runs.
+            #[cfg(target_os = "windows")]
+            {
+                ahk::disable_power_throttling(unsafe {
+                    winapi::um::processthreadsapi::GetCurrentProcess()
+                });
+                state.hotkeys_ahk.lock().unwrap().keep_responsive();
+                state.copilot_ahk.lock().unwrap().keep_responsive();
+            }
         }
     });
 }
