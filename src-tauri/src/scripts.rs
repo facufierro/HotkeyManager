@@ -13,11 +13,31 @@ fn python_candidates(configured: &str) -> Vec<String> {
     vec!["python".to_string(), "py".to_string()]
 }
 
-/// Run a script: spawn the Python interpreter on either its `.py` file (source = "path") or
-/// on inline code written to a file under `scripts_path` (source = "code"). Returns the spawned
-/// child so the caller can track it and terminate it when the app quits or the owning profile is
-/// disarmed, instead of letting it outlive the app.
-pub fn run_script(python_exe: &str, script: &Script, scripts_path: &Path) -> Result<std::process::Child, String> {
+/// Run a Python or AutoHotkey script from a file (source = "path") or from inline code written
+/// under `scripts_path` (source = "code"). Returns the spawned child so the caller can track it
+/// and terminate it when the app quits or the owning profile is disarmed.
+pub fn run_script(
+    python_exe: &str,
+    ahk_exe: &str,
+    script: &Script,
+    scripts_path: &Path,
+) -> Result<std::process::Child, String> {
+    let (extension, interpreters, interpreter_name, setting_name) = match script.language.as_str() {
+        "python" => (
+            "py",
+            python_candidates(python_exe),
+            "Python",
+            "Python executable path",
+        ),
+        "autohotkey" => (
+            "ahk",
+            vec![ahk_exe.to_string()],
+            "AutoHotkey",
+            "AutoHotkey executable path",
+        ),
+        language => return Err(format!("Unsupported script language '{language}'.")),
+    };
+
     let target = if script.source == "path" {
         let path = script.path.trim();
         if path.is_empty() {
@@ -25,18 +45,18 @@ pub fn run_script(python_exe: &str, script: &Script, scripts_path: &Path) -> Res
         }
         std::path::PathBuf::from(path)
     } else {
-        let file = scripts_path.join(format!("py-{}.py", script.id));
+        let file = scripts_path.join(format!("{extension}-{}.{extension}", script.id));
         std::fs::write(&file, &script.code)
             .map_err(|e| format!("Could not write the script file: {e}"))?;
         file
     };
 
     let mut last_err = String::new();
-    for interpreter in python_candidates(python_exe) {
+    for interpreter in interpreters {
         let mut command = Command::new(&interpreter);
         command.arg(&target);
         // Run from the script's own folder so relative paths in the script resolve next to it
-        // (a path script → its .py's directory; inline code → the scripts data folder).
+        // (a path script → its file's directory; inline code → the scripts data folder).
         if let Some(dir) = target.parent() {
             command.current_dir(dir);
         }
@@ -53,6 +73,6 @@ pub fn run_script(python_exe: &str, script: &Script, scripts_path: &Path) -> Res
         }
     }
     Err(format!(
-        "Could not start Python. {last_err}. Set the Python executable path in Settings."
+        "Could not start {interpreter_name}. {last_err}. Set the {setting_name} in Settings."
     ))
 }
