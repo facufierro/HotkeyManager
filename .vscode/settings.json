@@ -10,6 +10,13 @@
                 "tooltip": "Open Git Graph — view branches and commit history"
             },
             {
+                "name": "$(git-commit) Commit",
+                "singleInstance": true,
+                "command": "powershell -ExecutionPolicy Bypass -File '${workspaceFolder}\\.vscode\\scripts\\commit.ps1'",
+                "color": "#2196F3",
+                "tooltip": "Run the Codex commit skill"
+            },
+            {
                 "name": "$(play) Run Dev",
                 "color": "#7c6af7",
                 "command": "Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile -NoExit -ExecutionPolicy Bypass -File D:\\Projects\\Games\\MacroToolbox\\dev.ps1'",

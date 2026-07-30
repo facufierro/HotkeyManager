@@ -83,6 +83,7 @@ export interface Profile {
 
 export type ScriptTrigger = "hotkey" | "launch";
 export type ScriptSource = "code" | "path";
+export type ScriptLanguage = "python" | "autohotkey";
 
 export interface Script {
   id: string;
@@ -90,6 +91,7 @@ export interface Script {
   enabled: boolean;
   trigger: ScriptTrigger;
   hotkey: string;
+  language: ScriptLanguage;
   source: ScriptSource;
   code: string;
   path: string;

@@ -1452,8 +1452,18 @@ fn is_process_running(exe: &str) -> bool {
 /// Spawn a script and place it in its owning profile's kill-on-close Job Object, so it — and
 /// anything it spawns — is bound to the app's lifetime: it dies when the app exits (even a crash
 /// or hard-kill) or when the profile is disarmed, and can never outlive the app.
-fn spawn_tracked_script(state: &AppState, python_exe: &str, script: &Script, profile_id: &str) -> Result<(), String> {
-    let child = scripts::run_script(python_exe, script, &state.scripts_path)?;
+fn spawn_tracked_script(state: &AppState, settings: &Settings, script: &Script, profile_id: &str) -> Result<(), String> {
+    let ahk_exe = state
+        .hotkeys_ahk
+        .lock()
+        .unwrap()
+        .executable_path(&settings.ahk_exe);
+    let child = scripts::run_script(
+        &settings.python_exe,
+        &ahk_exe,
+        script,
+        &state.scripts_path,
+    )?;
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::io::AsRawHandle;
@@ -1499,7 +1509,7 @@ fn run_script_by_id(handle: &tauri::AppHandle, id: &str) {
     for game in &db.games {
         for profile in &game.profiles {
             if let Some(script) = profile.scripts.iter().find(|s| s.id == id) {
-                if let Err(e) = spawn_tracked_script(&state, &db.settings.python_exe, script, &profile.id) {
+                if let Err(e) = spawn_tracked_script(&state, &db.settings, script, &profile.id) {
                     eprintln!("[scripts] {e}");
                 }
                 return;
@@ -1518,7 +1528,7 @@ fn run_script_now(state: State<AppState>, script: Script) -> Result<(), String> 
         .find(|p| p.scripts.iter().any(|s| s.id == script.id))
         .map(|p| p.id.clone())
         .unwrap_or_else(|| "__adhoc__".to_string());
-    spawn_tracked_script(&state, &db.settings.python_exe, &script, &profile_id)
+    spawn_tracked_script(&state, &db.settings, &script, &profile_id)
 }
 
 fn start_watcher(handle: tauri::AppHandle) {
@@ -1560,7 +1570,7 @@ fn start_watcher(handle: tauri::AppHandle) {
                     let was_running = launch_running.insert(profile.id.clone(), now_running);
                     if was_running == Some(false) && now_running {
                         for script in profile.scripts.iter().filter(|s| s.enabled && s.trigger == "launch") {
-                            if let Err(e) = spawn_tracked_script(&state, &db.settings.python_exe, script, &profile.id) {
+                            if let Err(e) = spawn_tracked_script(&state, &db.settings, script, &profile.id) {
                                 eprintln!("[scripts] {e}");
                             }
                         }

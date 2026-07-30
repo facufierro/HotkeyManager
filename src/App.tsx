@@ -65,7 +65,7 @@ function blankIcon():    OverlayItem { return { type: "icon",  id: uid(), name: 
 function blankBar():     OverlayItem { return { type: "bar",   id: uid(), name: "", x: 0, y: 0, w: 200, h: 20, color: "#4ade80", max_value: 100, state_id: null }; }
 function blankText():    OverlayItem { return { type: "text",  id: uid(), name: "", x: 0, y: 0, font_size: 16, color: "#ffffff", content: "", state_id: null }; }
 function blankState(): ProfileState { return { id: uid(), name: "", duration_ms: null }; }
-function blankScript(): Script { return { id: uid(), name: "", enabled: true, trigger: "hotkey", hotkey: "", source: "code", code: "", path: "" }; }
+function blankScript(): Script { return { id: uid(), name: "", enabled: true, trigger: "hotkey", hotkey: "", language: "python", source: "code", code: "", path: "" }; }
 
 // ── Export / Import helpers ───────────────────────────────────────────────────
 
@@ -1410,6 +1410,10 @@ function scriptTriggerDesc(script: Script): string {
     : "on app launch";
 }
 
+function scriptLanguageLabel(script: Script): string {
+  return script.language === "autohotkey" ? "AutoHotkey" : "Python";
+}
+
 function ScriptRow({ script, onEdit, onRun, onToggle, onDelete }: {
   script: Script;
   onEdit: () => void;
@@ -1420,7 +1424,7 @@ function ScriptRow({ script, onEdit, onRun, onToggle, onDelete }: {
   return (
     <div className={`step-row${script.enabled ? "" : " step-row--muted"}`}>
       <span className="overlay-type-badge overlay-type-badge--text">{script.name || "Unnamed"} - script</span>
-      <span className="overlay-item-desc">{scriptTriggerDesc(script)} · {script.source === "path" ? "file" : "inline"}</span>
+      <span className="overlay-item-desc">{scriptTriggerDesc(script)} · {scriptLanguageLabel(script)} · {script.source === "path" ? "file" : "inline"}</span>
       <div className="step-row__btns">
         <button className="icon-btn" title={script.enabled ? "Disable" : "Enable"} onClick={onToggle}>{script.enabled ? "◉" : "○"}</button>
         <button className="icon-btn" title="Run now" onClick={onRun}>▶</button>
@@ -1440,16 +1444,23 @@ function ScriptModal({ initial, onSave, onClose }: {
   const [enabled, setEnabled] = useState(initial.enabled);
   const [trigger, setTrigger] = useState(initial.trigger);
   const [hotkey, setHotkey] = useState(initial.hotkey);
+  const [language, setLanguage] = useState(initial.language ?? "python");
   const [source, setSource] = useState(initial.source);
   const [code, setCode] = useState(initial.code);
   const [path, setPath] = useState(initial.path);
 
   function build(): Script {
-    return { id: initial.id, name: name.trim(), enabled, trigger, hotkey, source, code, path: path.trim() };
+    return { id: initial.id, name: name.trim(), enabled, trigger, hotkey, language, source, code, path: path.trim() };
   }
 
   async function browse() {
-    const selected = await openDialog({ title: "Select Python Script", filters: [{ name: "Python", extensions: ["py"] }], multiple: false, directory: false });
+    const isAhk = language === "autohotkey";
+    const selected = await openDialog({
+      title: `Select ${isAhk ? "AutoHotkey" : "Python"} Script`,
+      filters: [{ name: isAhk ? "AutoHotkey" : "Python", extensions: [isAhk ? "ahk" : "py"] }],
+      multiple: false,
+      directory: false,
+    });
     if (selected) setPath(selected as string);
   }
 
@@ -1469,17 +1480,24 @@ function ScriptModal({ initial, onSave, onClose }: {
           <KeyInput value={hotkey} onChange={setHotkey} placeholder="Hotkey" />
         )}
 
+        <select value={language} onChange={e => setLanguage(e.target.value as Script["language"])}>
+          <option value="python">Python</option>
+          <option value="autohotkey">AutoHotkey v2</option>
+        </select>
+
         <select value={source} onChange={e => setSource(e.target.value as Script["source"])}>
-          <option value="code">Python code</option>
-          <option value="path">Path to a .py file</option>
+          <option value="code">Inline code</option>
+          <option value="path">Path to a .{language === "autohotkey" ? "ahk" : "py"} file</option>
         </select>
 
         {source === "code" ? (
           <textarea value={code} onChange={e => setCode(e.target.value)} rows={12} spellCheck={false}
-            style={{ fontFamily: "monospace", resize: "vertical" }} placeholder="print('hello')" />
+            style={{ fontFamily: "monospace", resize: "vertical" }}
+            placeholder={language === "autohotkey" ? '#Requires AutoHotkey v2.0\nMsgBox "Hello"' : "print('hello')"} />
         ) : (
           <div className="input-row">
-            <input value={path} onChange={e => setPath(e.target.value)} placeholder="C:\path\to\script.py" />
+            <input value={path} onChange={e => setPath(e.target.value)}
+              placeholder={`C:\\path\\to\\script.${language === "autohotkey" ? "ahk" : "py"}`} />
             <button className="btn btn--ghost" onClick={browse}>Browse…</button>
           </div>
         )}
