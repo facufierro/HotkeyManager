@@ -27,9 +27,9 @@ pub struct Game {
     pub profiles: Vec<Profile>,
 }
 
-/// A Python script owned by a profile. It runs either when its hotkey is pressed (while the
+/// A user script owned by a profile. It runs either when its hotkey is pressed (while the
 /// profile's app is focused) or when the profile's app is launched. The body is either inline
-/// code typed by the user or a path to a `.py` file.
+/// code typed by the user or a path to a script file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Script {
     pub id: String,
@@ -42,18 +42,25 @@ pub struct Script {
     /// The key combo when `trigger` is "hotkey".
     #[serde(default)]
     pub hotkey: String,
+    /// "python" | "autohotkey". Missing on older saved scripts, which were always Python.
+    #[serde(default = "default_script_language")]
+    pub language: String,
     /// "code" | "path"
     pub source: String,
-    /// Inline Python when `source` is "code".
+    /// Inline Python or AutoHotkey code when `source` is "code".
     #[serde(default)]
     pub code: String,
-    /// Path to a `.py` file when `source` is "path".
+    /// Path to a `.py` or `.ahk` file when `source` is "path".
     #[serde(default)]
     pub path: String,
 }
 
 fn default_script_enabled() -> bool {
     true
+}
+
+fn default_script_language() -> String {
+    "python".to_string()
 }
 
 fn default_profile_kind() -> String {

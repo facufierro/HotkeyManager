@@ -287,6 +287,12 @@ impl AhkManager {
         Ok(())
     }
 
+    /// Resolve the configured interpreter exactly as manager-owned scripts do, including the
+    /// bundled AutoHotkey v2 executable when no custom path is configured.
+    pub fn executable_path(&self, configured: &str) -> String {
+        resolve_ahk_exe(configured, self.bundled_ahk_exe.as_deref())
+    }
+
     pub fn kill(&mut self) {
         if let Some(mut child) = self.process.take() {
             let _ = child.kill();
