@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Database, Scope, Profile, Settings, Script } from "./types";
+import type { Database, Scope, Profile, Settings } from "./types";
 
 export const api = {
   getDatabase: () =>
@@ -42,9 +42,6 @@ export const api = {
 
   setProfileArmed: (profileId: string, armed: boolean) =>
     invoke<Database>("set_profile_armed", { profileId, armed }),
-
-  runScriptNow: (script: Script) =>
-    invoke<void>("run_script_now", { script }),
 
   getAhkStatus: () =>
     invoke<boolean>("get_ahk_status"),

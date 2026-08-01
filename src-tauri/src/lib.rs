@@ -1518,19 +1518,6 @@ fn run_script_by_id(handle: &tauri::AppHandle, id: &str) {
     }
 }
 
-/// Run a script on demand (the "Run now" button), so the user can test it — including
-/// unsaved edits — without waiting for its trigger.
-#[tauri::command]
-fn run_script_now(state: State<AppState>, script: Script) -> Result<(), String> {
-    let db = config::load_db(&state.db_path)?;
-    let profile_id = db.games.iter()
-        .flat_map(|g| &g.profiles)
-        .find(|p| p.scripts.iter().any(|s| s.id == script.id))
-        .map(|p| p.id.clone())
-        .unwrap_or_else(|| "__adhoc__".to_string());
-    spawn_tracked_script(&state, &db.settings, &script, &profile_id)
-}
-
 fn start_watcher(handle: tauri::AppHandle) {
     std::thread::spawn(move || {
         let mut last_tick = std::time::SystemTime::now();
@@ -1538,8 +1525,16 @@ fn start_watcher(handle: tauri::AppHandle) {
         // once on the not-running -> running edge. A profile whose app is already running at
         // first observation is seeded, so it doesn't fire retroactively.
         let mut launch_running: HashMap<String, bool> = HashMap::new();
+        let mut first_tick = true;
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(3));
+            // Establish the process baseline immediately. Sleeping before the first observation
+            // could miss an app launched during those first three seconds: it would appear as
+            // already running instead of as a not-running -> running transition.
+            if first_tick {
+                first_tick = false;
+            } else {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+            }
 
             // A wall-clock jump across a 3s sleep means the machine was suspended. Windows may
             // have dropped the AHK hooks, so relaunch the hotkeys script fresh below.
@@ -1819,7 +1814,6 @@ pub fn run() {
             upsert_profile,
             delete_profile,
             set_profile_armed,
-            run_script_now,
             get_ahk_status,
             save_settings,
             get_app_version,
