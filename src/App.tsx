@@ -202,7 +202,9 @@ function toAhkKey(e: KeyboardEvent, activeSideModifiers: Set<string>): string {
     Backspace: "Backspace", Delete: "Del", Insert: "Ins", Home: "Home", End: "End",
     PrintScreen: "PrintScreen", NumLock: "NumLock", CapsLock: "CapsLock",
   };
-  let key = e.key;
+  // Unlike e.key, e.code retains the keypad position when Num Lock is off.
+  // Keep keypad digits named so they do not collapse into top-row digits.
+  let key = /^Numpad[0-9]$/.test(e.code) ? e.code : e.key;
   if (key in keyMap) key = keyMap[key];
   else if (/^F\d+$/.test(key)) key = key.toLowerCase();
   else if (key.length === 1) {
@@ -1414,10 +1416,9 @@ function scriptLanguageLabel(script: Script): string {
   return script.language === "autohotkey" ? "AutoHotkey" : "Python";
 }
 
-function ScriptRow({ script, onEdit, onRun, onToggle, onDelete }: {
+function ScriptRow({ script, onEdit, onToggle, onDelete }: {
   script: Script;
   onEdit: () => void;
-  onRun: () => void;
   onToggle: () => void;
   onDelete: () => void;
 }) {
@@ -1427,7 +1428,6 @@ function ScriptRow({ script, onEdit, onRun, onToggle, onDelete }: {
       <span className="overlay-item-desc">{scriptTriggerDesc(script)} · {scriptLanguageLabel(script)} · {script.source === "path" ? "file" : "inline"}</span>
       <div className="step-row__btns">
         <button className="icon-btn" title={script.enabled ? "Disable" : "Enable"} onClick={onToggle}>{script.enabled ? "◉" : "○"}</button>
-        <button className="icon-btn" title="Run now" onClick={onRun}>▶</button>
         <button className="icon-btn" title="Edit" onClick={onEdit}>✏</button>
         <button className="icon-btn icon-btn--danger" title="Delete" onClick={onDelete}>✕</button>
       </div>
@@ -1632,7 +1632,6 @@ function ProfileEditor({ folder, profile, showStates, onExitStates, onContext, o
               {profile.scripts.map((script, i) => (
                 <ScriptRow key={script.id} script={script}
                   onEdit={() => onModal({ type: "script", gameId: folder.id, profileId, index: i, script })}
-                  onRun={() => api.runScriptNow(script).catch(e => alert(String(e)))}
                   onToggle={() => saveScripts(profile.scripts.map((s, idx) => idx === i ? { ...s, enabled: !s.enabled } : s))}
                   onDelete={() => saveScripts(profile.scripts.filter((_, idx) => idx !== i))} />
               ))}
