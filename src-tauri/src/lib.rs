@@ -35,12 +35,10 @@ struct WindowClientBounds {
 pub struct AppState {
     pub db_path: std::path::PathBuf,
     pub scripts_path: std::path::PathBuf,
-    /// The single always-on AutoHotkey process holding every armed profile's hotkeys, each
-    /// gated to its own app via #HotIf. Regenerated + relaunched whenever profiles change.
+    /// The single always-on AutoHotkey process holding the Copilot remap and every armed
+    /// profile's hotkeys, each gated to its own app via #HotIf. Regenerated + relaunched
+    /// whenever profiles change.
     pub hotkeys_ahk: Mutex<ahk::AhkManager>,
-    /// Persistent AutoHotkey process that remaps the Copilot key to Right Ctrl, always on
-    /// while the app runs (independent of profiles).
-    pub copilot_ahk: Mutex<ahk::AhkManager>,
     pub overlay_config: Mutex<config::OverlayConfig>,
     /// One Windows Job Object per profile (each kill-on-close) holding that profile's launched
     /// script processes. Everything in the job dies when the app process exits — even on a crash
@@ -434,7 +432,6 @@ fn hide_main_window(app: &tauri::AppHandle) {
 fn quit_app(app: &tauri::AppHandle) {
     let state = app.state::<AppState>();
     state.hotkeys_ahk.lock().unwrap().kill();
-    state.copilot_ahk.lock().unwrap().kill();
     kill_all_scripts(&state);
     app.exit(0);
 }
@@ -487,8 +484,8 @@ fn is_global_game_exe(exe: &str) -> bool {
 }
 
 /// Regenerate the combined AHK script from every armed profile across all folders and
-/// (re)launch the single always-on hotkeys process. Called after any profile/arming change.
-/// If nothing is armed, the process is stopped. Note: an edit briefly drops all hotkeys while
+/// (re)launch the single always-on process. It stays alive even with no armed profiles because
+/// it also owns the Copilot-key remap. Called after any profile/arming change. Note: an edit
 /// the process relaunches — fine because edits happen from the manager UI, not in a game.
 fn sync_hotkeys(state: &AppState, db: &Database) {
     let mut armed: Vec<ahk::ArmedProfile> = Vec::new();
@@ -501,10 +498,6 @@ fn sync_hotkeys(state: &AppState, db: &Database) {
     }
 
     let mut mgr = state.hotkeys_ahk.lock().unwrap();
-    if armed.is_empty() {
-        mgr.kill();
-        return;
-    }
     let script = ahk::generate_combined_script(&armed);
     let script_path = state.scripts_path.join("hotkeys.ahk");
     if std::fs::write(&script_path, &script).is_ok() {
@@ -1573,21 +1566,17 @@ fn start_watcher(handle: tauri::AppHandle) {
                 }
             }
 
-            // Keep the single always-on hotkeys script alive: relaunch after a suspend and if it
-            // died while any profile is armed; stop it when nothing is armed. #HotIf does all the
-            // focus gating, so there's no per-app launch/kill here anymore.
-            let any_armed = db.games.iter().flat_map(|g| &g.profiles).any(|p| p.armed);
+            // Keep the single hotkey/Copilot script alive and relaunch it after suspend. #HotIf
+            // handles profile focus gating; the Copilot remap remains active with no profiles.
             if resumed {
                 state.hotkeys_ahk.lock().unwrap().kill();
             }
             let running = state.hotkeys_ahk.lock().unwrap().is_running();
-            if any_armed && !running {
+            if !running {
                 sync_hotkeys(&state, &db);
-            } else if !any_armed {
-                state.hotkeys_ahk.lock().unwrap().kill();
             }
 
-            // Re-assert that the app and its AutoHotkey processes stay out of Windows Efficiency
+            // Re-assert that the app and its AutoHotkey process stay out of Windows Efficiency
             // Mode: the one-shot opt-out at launch doesn't hold once the app drops to the tray, so
             // Windows re-throttles the tree and the hotkey hook goes dead after idle. Re-applying
             // it every tick keeps the tree exempt for as long as the app runs.
@@ -1597,7 +1586,6 @@ fn start_watcher(handle: tauri::AppHandle) {
                     winapi::um::processthreadsapi::GetCurrentProcess()
                 });
                 state.hotkeys_ahk.lock().unwrap().keep_responsive();
-                state.copilot_ahk.lock().unwrap().keep_responsive();
             }
         }
     });
@@ -1641,7 +1629,6 @@ pub fn run() {
 
                     if !close_to_tray {
                         state.hotkeys_ahk.lock().unwrap().kill();
-                        state.copilot_ahk.lock().unwrap().kill();
                         kill_all_scripts(&state);
                     }
                 }
@@ -1675,8 +1662,7 @@ pub fn run() {
             app.manage(AppState {
                 db_path: db_path.clone(),
                 scripts_path: scripts_dir,
-                hotkeys_ahk: Mutex::new(ahk::AhkManager::new(resource_dir.clone())),
-                copilot_ahk: Mutex::new(ahk::AhkManager::new(resource_dir)),
+                hotkeys_ahk: Mutex::new(ahk::AhkManager::new(resource_dir)),
                 overlay_config: Mutex::new(config::OverlayConfig::default()),
                 #[cfg(target_os = "windows")]
                 script_jobs: Mutex::new(HashMap::new()),
@@ -1684,21 +1670,7 @@ pub fn run() {
                 borderless_windows: Mutex::new(HashMap::new()),
             });
 
-            // Launch the always-on Copilot-key -> Right Ctrl remap as its own AHK process.
-            {
-                let state = app.state::<AppState>();
-                let copilot_path = state.scripts_path.join("copilot-fix.ahk");
-                if std::fs::write(&copilot_path, ahk::COPILOT_FIX_SCRIPT).is_ok() {
-                    let _ = state
-                        .copilot_ahk
-                        .lock()
-                        .unwrap()
-                        .launch(&startup_settings.ahk_exe, &copilot_path);
-                }
-            }
-
-            // Launch the combined hotkeys script for every armed profile so hotkeys work at
-            // startup, each gated to its own app.
+            // Launch the combined Copilot remap and profile hotkeys script at startup.
             {
                 let state = app.state::<AppState>();
                 if let Ok(db) = config::load_db(&state.db_path) {

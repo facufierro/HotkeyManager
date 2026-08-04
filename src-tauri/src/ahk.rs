@@ -128,116 +128,6 @@ pub fn disable_power_throttling(process: winapi::um::winnt::HANDLE) {
 /// specify one. Kept small so a game that acts on the key per frame registers ~one press.
 const DEFAULT_REPEAT_HOLD_MS: u64 = 6;
 
-/// Always-on remap of the Microsoft Copilot key to Right Ctrl, run as its own persistent
-/// AutoHotkey process. The Copilot key fires LWin+LShift+F23 (scancode SC06E) ~1ms apart;
-/// this 3-state machine holds LWin/LShift for 30ms and, only if the Copilot scancode
-/// follows, turns the whole thing into Right Ctrl. Real Win/Shift presses pass through
-/// untouched (after a ~30ms delay). Based on the open-source `copilot-key-fix` script.
-pub const COPILOT_FIX_SCRIPT: &str = r#"#Requires AutoHotkey v2.0
-#SingleInstance Force
-
-; Holding the Copilot key makes Windows auto-repeat its scancode ~50x/sec, so this hotkey
-; fires dozens of times a second while held. Raise AHK's runaway-hotkey guard (default 70 per
-; 2s) well above that so the "N hotkeys received" warning never pops and kills the remap.
-A_MaxHotkeysPerInterval := 1000
-
-global state := "idle"
-global shiftSuppressed := false
-global rctrlHeld := false
-
-; LWin: intercept and hold briefly to see whether the Copilot key's F23 follows.
-$*LWin::{
-    global state
-    state := "waiting"
-    SetTimer(PassKeys, -30)
-}
-
-$*LWin up::{
-    global state, shiftSuppressed
-    if state = "waiting" {
-        SetTimer(PassKeys, 0)
-        state := "idle"
-        if shiftSuppressed {
-            shiftSuppressed := false
-            SendInput "{LWin down}{LShift down}{LWin up}"
-        } else {
-            SendInput "{LWin down}{LWin up}"
-        }
-    } else if state = "lwin_passed" {
-        state := "idle"
-        SendInput "{LWin up}"
-    }
-}
-
-; LShift: only swallow it while we're waiting to see the Copilot key.
-$*LShift::{
-    global state, shiftSuppressed
-    if state = "waiting" {
-        shiftSuppressed := true
-    } else {
-        shiftSuppressed := false
-        SendInput "{LShift down}"
-    }
-}
-
-$*LShift up::{
-    global shiftSuppressed
-    if shiftSuppressed {
-        shiftSuppressed := false
-    } else {
-        SendInput "{LShift up}"
-    }
-}
-
-; 30ms passed without F23 -> these were real Win/Shift presses; pass them through.
-PassKeys() {
-    global state, shiftSuppressed
-    if state = "waiting" {
-        state := "lwin_passed"
-        if shiftSuppressed {
-            shiftSuppressed := false
-            SendInput "{LWin down}{LShift down}"
-        } else {
-            SendInput "{LWin down}"
-        }
-    }
-}
-
-; F23 (scancode SC06E) = the Copilot key -> hold Right Ctrl. Holding the key makes Windows
-; auto-repeat SC06E; re-sending "{RCtrl down}" on every repeat made RCtrl register dozens of
-; presses. Track it with rctrlHeld so the down is sent once, and release on the key's own up
-; regardless of `state` so a state clobbered mid-hold can never leave RCtrl stuck down (a stuck
-; RCtrl silently turns every other hotkey into a Ctrl+ combo).
-$*SC06E::{
-    global state, shiftSuppressed, rctrlHeld
-    SetTimer(PassKeys, 0)
-    state := "copilot"
-    shiftSuppressed := false
-    if rctrlHeld
-        return
-    rctrlHeld := true
-    SendInput "{RCtrl down}"
-}
-
-$*SC06E up::{
-    global state, rctrlHeld
-    if state = "copilot"
-        state := "idle"
-    if rctrlHeld {
-        rctrlHeld := false
-        SendInput "{RCtrl up}"
-    }
-}
-
-; Safety: release everything if this script exits cleanly.
-OnExit(ReleaseHeld)
-ReleaseHeld(*) {
-    global rctrlHeld
-    rctrlHeld := false
-    SendInput "{RCtrl up}{LWin up}{LShift up}"
-}
-"#;
-
 pub struct AhkManager {
     process: Option<Child>,
     bundled_ahk_exe: Option<PathBuf>,
@@ -527,7 +417,12 @@ global overlayVisible := false
 global overlayProfiles := []
 global lastFocusId := ""
 global repeatDown := Map()
+global copilotState := "idle"
+global copilotShiftSuppressed := false
+global copilotCtrlHeld := false
+global copilotCtrlReleasePending := false
 {enabled_init}{overlay_init}OnExit HideOverlayOnExit
+OnExit ReleaseCopilotHeld
 
 SendOverlayCommand(path) {{
     try {{
@@ -610,15 +505,12 @@ SyncOverlay()
 ; Windows silently removes low-level hooks when the system sleeps or the hook
 ; times out while the process is throttled in the background (idle in the tray),
 ; leaving hotkeys dead even though this script is still running. Install both hooks
-; up front and reinstall them on wake and whenever the keyboard hook looks dropped.
+; up front and reinstall them after a wake or a detected process stall.
 InstallKeybdHook true, true
 InstallMouseHook true, true
-global lastHookReinstall := 0
 global lastHealthTick := A_TickCount
 
 ReinstallHooks() {{
-    global lastHookReinstall
-    lastHookReinstall := A_TickCount
     InstallKeybdHook true, true
     InstallMouseHook true, true
 }}
@@ -632,27 +524,22 @@ OnPowerBroadcast(wParam, lParam, msg, hwnd) {{
 }}
 
 CheckHookHealth(*) {{
-    global lastHookReinstall, lastHealthTick
+    global lastHealthTick
     ; This 1-second timer firing far late means the process was throttled or suspended (idle in
     ; the tray under Efficiency Mode, or a real sleep). Windows drops the low-level hooks in that
     ; state, so reinstall them the instant we run again — this is what makes hotkeys recover
-    ; promptly after idle instead of staying dead until the idle heuristic below finally trips.
+    ; promptly after the process resumes.
     gap := A_TickCount - lastHealthTick
     lastHealthTick := A_TickCount
     if (gap > 3000) {{
         ReinstallHooks()
-        return
     }}
-    ; A_TimeIdle is the OS-wide idle time (GetLastInputInfo); A_TimeIdleKeyboard is
-    ; how long this script's keyboard hook has gone without a keystroke. If the OS
-    ; just registered input but the keyboard hook has been silent far longer, Windows
-    ; dropped the hook - reinstall it. Watching the keyboard hook itself (instead of
-    ; A_TimeIdlePhysical) keeps mouse movement from masking a dead keyboard hook,
-    ; which is what left hotkeys permanently dead after idling in the tray.
-    if (A_TimeIdle < 1000 && A_TimeIdleKeyboard > 10000 && A_TickCount - lastHookReinstall > 10000)
-        ReinstallHooks()
 }}
 SetTimer CheckHookHealth, 1000
+
+; A previous force-terminated instance can leave synthesized modifiers logically down.
+; Clear only keys which are not physically held, so startup cannot cancel real input.
+ReleaseStaleCopilotModifiers()
 
 ; --- TEMP DIAGNOSTIC: liveness heartbeat, logged next to this script (ahk-heartbeat.log).
 ; Consecutive lines whose A_TickCount differs by far more than 1000 mean Windows froze or
@@ -666,6 +553,137 @@ Heartbeat() {{
     try FileAppend A_TickCount " " A_Now "`n", heartbeatLog
 }}
 SetTimer Heartbeat, 1000
+
+; The Copilot key arrives as LWin+LShift+F23 (SC06E). Keep this remap in the same
+; process as every other hotkey so there is one keyboard hook and one modifier-state owner.
+CopilotKeyPhysicallyDown() {{
+    ; Poll Windows directly instead of trusting hook state: this still detects release if the
+    ; low-level hook misses the F23 key-up while Windows is resuming or under load.
+    return (DllCall("GetAsyncKeyState", "Int", 0x86, "Short") & 0x8000) != 0
+}}
+
+ReleaseStaleCopilotModifiers() {{
+    if !GetKeyState("RCtrl", "P") && !CopilotKeyPhysicallyDown()
+        SendInput "{{Blind}}{{RCtrl up}}"
+    if !GetKeyState("LWin", "P")
+        SendInput "{{Blind}}{{LWin up}}"
+    if !GetKeyState("LShift", "P")
+        SendInput "{{Blind}}{{LShift up}}"
+}}
+
+ReleaseCopilotCtrl() {{
+    global copilotCtrlHeld, copilotCtrlReleasePending
+    if !copilotCtrlHeld
+        return
+    copilotCtrlHeld := false
+    ; Do not cancel a real Right Ctrl which happens to be held at the same time. Keep the
+    ; poll alive and clear our synthetic DownR immediately after the physical key is released.
+    if GetKeyState("RCtrl", "P") {{
+        copilotCtrlReleasePending := true
+    }} else {{
+        copilotCtrlReleasePending := false
+        SetTimer CheckCopilotRelease, 0
+        SendInput "{{Blind}}{{RCtrl up}}"
+    }}
+}}
+
+ReleaseCopilotHeld(*) {{
+    global copilotCtrlReleasePending
+    ReleaseCopilotCtrl()
+    if copilotCtrlReleasePending && !GetKeyState("RCtrl", "P")
+        SendInput "{{Blind}}{{RCtrl up}}"
+    copilotCtrlReleasePending := false
+    if !GetKeyState("LWin", "P")
+        SendInput "{{Blind}}{{LWin up}}"
+    if !GetKeyState("LShift", "P")
+        SendInput "{{Blind}}{{LShift up}}"
+}}
+
+CheckCopilotRelease(*) {{
+    global copilotCtrlHeld, copilotCtrlReleasePending
+    if copilotCtrlHeld && !CopilotKeyPhysicallyDown()
+        ReleaseCopilotCtrl()
+    if copilotCtrlReleasePending && !GetKeyState("RCtrl", "P") {{
+        copilotCtrlReleasePending := false
+        SetTimer CheckCopilotRelease, 0
+        SendInput "{{Blind}}{{RCtrl up}}"
+    }}
+}}
+
+PassCopilotKeys() {{
+    global copilotState, copilotShiftSuppressed
+    if copilotState = "waiting" {{
+        copilotState := "lwin_passed"
+        if copilotShiftSuppressed {{
+            copilotShiftSuppressed := false
+            SendInput "{{LWin down}}{{LShift down}}"
+        }} else {{
+            SendInput "{{LWin down}}"
+        }}
+    }}
+}}
+
+$*LWin::{{
+    global copilotState
+    copilotState := "waiting"
+    SetTimer(PassCopilotKeys, -30)
+}}
+
+$*LWin up::{{
+    global copilotState, copilotShiftSuppressed
+    if copilotState = "waiting" {{
+        SetTimer(PassCopilotKeys, 0)
+        copilotState := "idle"
+        if copilotShiftSuppressed {{
+            copilotShiftSuppressed := false
+            SendInput "{{LWin down}}{{LShift down}}{{LWin up}}"
+        }} else {{
+            SendInput "{{LWin down}}{{LWin up}}"
+        }}
+    }} else if copilotState = "lwin_passed" {{
+        copilotState := "idle"
+        SendInput "{{LWin up}}"
+    }}
+}}
+
+$*LShift::{{
+    global copilotState, copilotShiftSuppressed
+    if copilotState = "waiting" {{
+        copilotShiftSuppressed := true
+    }} else {{
+        copilotShiftSuppressed := false
+        SendInput "{{LShift down}}"
+    }}
+}}
+
+$*LShift up::{{
+    global copilotShiftSuppressed
+    if copilotShiftSuppressed {{
+        copilotShiftSuppressed := false
+    }} else {{
+        SendInput "{{LShift up}}"
+    }}
+}}
+
+$*SC06E::{{
+    global copilotState, copilotShiftSuppressed, copilotCtrlHeld, copilotCtrlReleasePending
+    SetTimer(PassCopilotKeys, 0)
+    copilotState := "copilot"
+    copilotShiftSuppressed := false
+    if copilotCtrlHeld
+        return
+    copilotCtrlHeld := true
+    copilotCtrlReleasePending := false
+    SendInput "{{Blind}}{{RCtrl downR}}"
+    SetTimer CheckCopilotRelease, 10
+}}
+
+$*SC06E up::{{
+    global copilotState
+    if copilotState = "copilot"
+        copilotState := "idle"
+    ReleaseCopilotCtrl()
+}}
 
 {repeat_up_lines}
 {blocks}
@@ -1274,3 +1292,18 @@ RepeatHold(keys, interval, triggerKey, exe, holdMs, enabledKey) {
     }
     repeatDown[triggerKey] := false
 }"###;
+
+#[cfg(test)]
+mod tests {
+    use super::generate_combined_script;
+
+    #[test]
+    fn combined_script_keeps_copilot_recovery_without_profiles() {
+        let script = generate_combined_script(&[]);
+
+        assert!(script.contains("$*SC06E::"));
+        assert!(script.contains("SetTimer CheckCopilotRelease, 10"));
+        assert!(script.contains("GetAsyncKeyState"));
+        assert!(!script.contains("A_TimeIdleKeyboard"));
+    }
+}
