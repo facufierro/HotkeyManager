@@ -419,6 +419,7 @@ global lastFocusId := ""
 global repeatDown := Map()
 global copilotState := "idle"
 global copilotShiftSuppressed := false
+global copilotShiftForwarded := false
 global copilotCtrlHeld := false
 global copilotCtrlReleasePending := false
 {enabled_init}{overlay_init}OnExit HideOverlayOnExit
@@ -588,11 +589,12 @@ ReleaseCopilotCtrl() {{
 }}
 
 ReleaseCopilotHeld(*) {{
-    global copilotCtrlReleasePending
+    global copilotCtrlReleasePending, copilotShiftForwarded
     ReleaseCopilotCtrl()
     if copilotCtrlReleasePending && !GetKeyState("RCtrl", "P")
         SendInput "{{Blind}}{{RCtrl up}}"
     copilotCtrlReleasePending := false
+    copilotShiftForwarded := false
     if !GetKeyState("LWin", "P")
         SendInput "{{Blind}}{{LWin up}}"
     if !GetKeyState("LShift", "P")
@@ -610,66 +612,86 @@ CheckCopilotRelease(*) {{
     }}
 }}
 
+CopilotShiftPhysicallyDown() {{
+    return (DllCall("GetAsyncKeyState", "Int", 0xA0, "Short") & 0x8000) != 0
+}}
+
+CheckCopilotShiftRelease(*) {{
+    global copilotShiftSuppressed, copilotShiftForwarded
+    shiftDown := CopilotShiftPhysicallyDown()
+    if copilotShiftSuppressed && !shiftDown
+        copilotShiftSuppressed := false
+    if copilotShiftForwarded && !shiftDown {{
+        copilotShiftForwarded := false
+        SendInput "{{Blind}}{{LShift up}}"
+    }}
+    if !copilotShiftSuppressed && !copilotShiftForwarded
+        SetTimer CheckCopilotShiftRelease, 0
+}}
+
 PassCopilotKeys() {{
-    global copilotState, copilotShiftSuppressed
-    if copilotState = "waiting" {{
-        copilotState := "lwin_passed"
-        if copilotShiftSuppressed {{
-            copilotShiftSuppressed := false
-            SendInput "{{LWin down}}{{LShift down}}"
-        }} else {{
-            SendInput "{{LWin down}}"
-        }}
+    global copilotState, copilotShiftSuppressed, copilotShiftForwarded
+    if copilotState != "waiting"
+        return
+    copilotState := "lwin_passed"
+    if copilotShiftSuppressed && CopilotShiftPhysicallyDown() {{
+        copilotShiftSuppressed := false
+        copilotShiftForwarded := true
+        SendInput "{{Blind}}{{LWin down}}{{LShift down}}"
+    }} else {{
+        copilotShiftSuppressed := false
+        SendInput "{{Blind}}{{LWin down}}"
     }}
 }}
 
 $*LWin::{{
     global copilotState
     copilotState := "waiting"
-    SetTimer(PassCopilotKeys, -30)
+    SetTimer PassCopilotKeys, -30
 }}
 
 $*LWin up::{{
-    global copilotState, copilotShiftSuppressed
+    global copilotState, copilotShiftSuppressed, copilotShiftForwarded
     if copilotState = "waiting" {{
-        SetTimer(PassCopilotKeys, 0)
+        SetTimer PassCopilotKeys, 0
         copilotState := "idle"
-        if copilotShiftSuppressed {{
+        if copilotShiftSuppressed && CopilotShiftPhysicallyDown() {{
             copilotShiftSuppressed := false
-            SendInput "{{LWin down}}{{LShift down}}{{LWin up}}"
+            copilotShiftForwarded := true
+            SendInput "{{Blind}}{{LWin down}}{{LShift down}}{{LWin up}}"
         }} else {{
-            SendInput "{{LWin down}}{{LWin up}}"
+            copilotShiftSuppressed := false
+            SendInput "{{Blind}}{{LWin down}}{{LWin up}}"
         }}
     }} else if copilotState = "lwin_passed" {{
         copilotState := "idle"
-        SendInput "{{LWin up}}"
+        SendInput "{{Blind}}{{LWin up}}"
     }}
 }}
 
+; Only the Shift which immediately follows an intercepted LWin can belong to the Copilot
+; chord. Every ordinary Shift press bypasses MacroToolbox and reaches games physically.
+#HotIf copilotState = "waiting"
 $*LShift::{{
-    global copilotState, copilotShiftSuppressed
-    if copilotState = "waiting" {{
-        copilotShiftSuppressed := true
-    }} else {{
-        copilotShiftSuppressed := false
-        SendInput "{{LShift down}}"
-    }}
-}}
-
-$*LShift up::{{
     global copilotShiftSuppressed
-    if copilotShiftSuppressed {{
-        copilotShiftSuppressed := false
-    }} else {{
-        SendInput "{{LShift up}}"
-    }}
+    copilotShiftSuppressed := true
+    SetTimer CheckCopilotShiftRelease, 5
 }}
+#HotIf
 
 $*SC06E::{{
-    global copilotState, copilotShiftSuppressed, copilotCtrlHeld, copilotCtrlReleasePending
-    SetTimer(PassCopilotKeys, 0)
+    global copilotState, copilotShiftSuppressed, copilotShiftForwarded
+    global copilotCtrlHeld, copilotCtrlReleasePending
+    modifiersForwarded := copilotState = "lwin_passed"
+    SetTimer PassCopilotKeys, 0
     copilotState := "copilot"
     copilotShiftSuppressed := false
+    SetTimer CheckCopilotShiftRelease, 0
+    if copilotShiftForwarded
+        SendInput "{{Blind}}{{LShift up}}"
+    copilotShiftForwarded := false
+    if modifiersForwarded
+        SendInput "{{Blind}}{{LWin up}}"
     if copilotCtrlHeld
         return
     copilotCtrlHeld := true
@@ -1136,55 +1158,75 @@ DoPress(keyStr, holdMs := 30, spin := false) {
         altKey := "RAlt"
     else if InStr(mods, "!")
         altKey := "Alt"
-    if (key = "m1" || key = "m2") {
-        phys    := (key = "m1") ? "LButton" : "RButton"
-        wasHeld := GetKeyState(phys, "P")
-        SendModState(ctrlKey,  "Down")
-        SendModState(shiftKey, "Down")
-        SendModState(altKey,   "Down")
-        if wasHeld
-            SendInput("{" phys " Up}")
-        Sleep 30
-        SendInput("{" phys " Down}")
-        Sleep 30
-        SendInput("{" phys " Up}")
-        SendModState(altKey,   "Up")
-        SendModState(shiftKey, "Up")
-        SendModState(ctrlKey,  "Up")
-        return
-    }
-    SendModState(ctrlKey,  "Down")
-    SendModState(shiftKey, "Down")
-    SendModState(altKey,   "Down")
-    if (mods != "")
-        Sleep 20
-    SendInput("{" key " Down}")
+    ctrlOwned := false
+    shiftOwned := false
+    altOwned := false
     try {
-        if (spin)
-            SpinHold(holdMs)  ; precise sub-Sleep-granularity hold for the repeat tap
-        else
-            Sleep holdMs
+        ; Acquire inside the protected region so a failed send cannot strand an earlier modifier.
+        ctrlOwned := AcquireModifier(ctrlKey)
+        shiftOwned := AcquireModifier(shiftKey)
+        altOwned := AcquireModifier(altKey)
+        if (key = "m1" || key = "m2") {
+            phys := (key = "m1") ? "LButton" : "RButton"
+            wasHeld := GetKeyState(phys, "P")
+            if wasHeld
+                SendInput("{Blind}{" phys " Up}")
+            Sleep 30
+            SendInput("{Blind}{" phys " Down}")
+            Sleep 30
+            SendInput("{Blind}{" phys " Up}")
+            if wasHeld
+                SendInput("{Blind}{" phys " Down}")
+            return
+        }
+        if (mods != "")
+            Sleep 20
+        SendInput("{Blind}{" key " Down}")
+        try {
+            if (spin)
+                SpinHold(holdMs)  ; precise sub-Sleep-granularity hold for the repeat tap
+            else
+                Sleep holdMs
+        } finally {
+            SendInput("{Blind}{" key " Up}")  ; always release, even if the hold throws
+        }
+        if (mods != "")
+            Sleep 20
     } finally {
-        SendInput("{" key " Up}")   ; always release, even if the hold throws, so no key sticks
+        ReleaseModifier(altKey, altOwned)
+        ReleaseModifier(shiftKey, shiftOwned)
+        ReleaseModifier(ctrlKey, ctrlOwned)
     }
-    if (mods != "")
-        Sleep 20
-    SendModState(altKey,   "Up")
-    SendModState(shiftKey, "Up")
-    SendModState(ctrlKey,  "Up")
 }
 
 DoPressKey(keyName) {
-    SendInput("{" keyName " Down}")
-    Sleep 30
-    SendInput("{" keyName " Up}")
+    if GetKeyState(keyName)
+        return
+    SendInput("{Blind}{" keyName " DownTemp}")
+    try {
+        Sleep 30
+    } finally {
+        if !GetKeyState(keyName, "P")
+            SendInput("{Blind}{" keyName " Up}")
+    }
 }
 
-; Press or release a modifier only if one is set. The SendInput is kept on its own
-; line: AHK v2 misparses a "{" string literal in a one-line "if" body as a block.
-SendModState(modKey, dir) {
-    if (modKey != "")
-        SendInput("{" modKey " " dir "}")
+; Acquire only modifier state that this action owns. A macro must never release a modifier
+; which was already held by the user or by the Copilot remap.
+AcquireModifier(modKey) {
+    if (modKey = "" || GetKeyState(modKey))
+        return false
+    SendInput("{Blind}{" modKey " DownTemp}")
+    return true
+}
+
+ReleaseModifier(modKey, owned) {
+    if !owned
+        return
+    ; If the user physically pressed it while the action ran, their eventual physical key-up
+    ; owns the release; sending one here would cancel the real held modifier.
+    if !GetKeyState(modKey, "P")
+        SendInput("{Blind}{" modKey " Up}")
 }
 
 ; A held remap. The press hotkey calls HoldKeyDown and a paired wildcard key-up
@@ -1304,6 +1346,13 @@ mod tests {
         assert!(script.contains("$*SC06E::"));
         assert!(script.contains("SetTimer CheckCopilotRelease, 10"));
         assert!(script.contains("GetAsyncKeyState"));
+        assert!(script.contains("#HotIf copilotState = \"waiting\"\n$*LShift::"));
+        assert_eq!(script.matches("$*LShift::").count(), 1);
+        assert!(!script.contains("$*LShift up::"));
+        assert!(script.contains("AcquireModifier(modKey)"));
+        assert!(script.contains("if (modKey = \"\" || GetKeyState(modKey))"));
+        assert!(script.contains("if !GetKeyState(modKey, \"P\")"));
+        assert!(!script.contains("SendModState("));
         assert!(!script.contains("A_TimeIdleKeyboard"));
     }
 }
