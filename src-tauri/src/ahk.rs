@@ -422,8 +422,12 @@ global copilotShiftSuppressed := false
 global copilotShiftForwarded := false
 global copilotCtrlHeld := false
 global copilotCtrlReleasePending := false
+global behaviorClipboardBackup := ""
+global behaviorClipboardPending := false
+global behaviorClipboardSequence := 0
 {enabled_init}{overlay_init}OnExit HideOverlayOnExit
 OnExit ReleaseCopilotHeld
+OnExit RestoreBehaviorClipboard
 
 SendOverlayCommand(path) {{
     try {{
@@ -997,13 +1001,66 @@ ExecuteBehavior(str) {
             } else if RegExMatch(token, "i)^sleep\((\d+)\)$", &m) {
                 Sleep Integer(m[1])
             } else if RegExMatch(token, "i)^send\((.+)\)$", &m) {
-                SendInput("{Text}" m[1])
+                SendBehaviorText(m[1])
             }
         }
     } finally {
         if locked
             BlockInput "MouseMoveOff"
     }
+}
+
+SendBehaviorText(text) {
+    global behaviorClipboardBackup, behaviorClipboardPending, behaviorClipboardSequence
+    try {
+        activeExe := WinGetProcessName("A")
+    } catch Error {
+        activeExe := ""
+    }
+
+    ; WhatsApp's packaged editor does not reliably consume the KEYEVENTF_UNICODE packets used
+    ; by Text mode. Paste through the clipboard there, preserving every clipboard format; other
+    ; applications keep the immediate Unicode-packet path.
+    if (activeExe != "WhatsApp.Root.exe" && activeExe != "WhatsApp.exe") {
+        SendInput("{Text}" text)
+        return
+    }
+
+    if !behaviorClipboardPending {
+        behaviorClipboardBackup := ClipboardAll()
+        behaviorClipboardPending := true
+        behaviorClipboardSequence := DllCall("GetClipboardSequenceNumber", "UInt")
+    }
+
+    try {
+        A_Clipboard := text
+        if !ClipWait(0.5) {
+            RestoreBehaviorClipboard()
+            return
+        }
+        behaviorClipboardSequence := DllCall("GetClipboardSequenceNumber", "UInt")
+        SendInput("^v")
+        ; WhatsApp reads clipboard data asynchronously after handling the paste shortcut. A
+        ; one-shot timer keeps this hotkey available for another character while it does so.
+        SetTimer RestoreBehaviorClipboard, -500
+    } catch Error as err {
+        RestoreBehaviorClipboard()
+        throw err
+    }
+}
+
+RestoreBehaviorClipboard(*) {
+    global behaviorClipboardBackup, behaviorClipboardPending, behaviorClipboardSequence
+    if !behaviorClipboardPending
+        return
+
+    ; Do not overwrite clipboard content the user copied after this macro started.
+    sequenceUnchanged := behaviorClipboardSequence = DllCall("GetClipboardSequenceNumber", "UInt")
+    behaviorClipboardPending := false
+    behaviorClipboardSequence := 0
+    if sequenceUnchanged
+        try A_Clipboard := behaviorClipboardBackup
+    behaviorClipboardBackup := ""
 }
 
 ResolveCoord(value, size) {
@@ -1354,5 +1411,10 @@ mod tests {
         assert!(script.contains("if !GetKeyState(modKey, \"P\")"));
         assert!(!script.contains("SendModState("));
         assert!(!script.contains("A_TimeIdleKeyboard"));
+        assert!(script.contains("SendBehaviorText(m[1])"));
+        assert!(script.contains("activeExe != \"WhatsApp.Root.exe\""));
+        assert!(script.contains("behaviorClipboardBackup := ClipboardAll()"));
+        assert!(script.contains("SetTimer RestoreBehaviorClipboard, -500"));
+        assert!(script.contains("OnExit RestoreBehaviorClipboard"));
     }
 }
