@@ -306,8 +306,12 @@ fn generate_profile_block(
                 let keys = escape_ahk_string(&repeat_keys);
                 let poll_key = escape_ahk_string(&poll_key);
                 let repeat_exe = if global_game { String::new() } else { exe_esc.clone() };
+                // A synthetic up for the trigger itself also changes Windows' asynchronous
+                // state. Keep the existing hook-based check for that supported configuration;
+                // otherwise the independent OS state is safe to use as a missed-up fallback.
+                let use_windows_state = !repeat_output_uses_trigger(&repeat_keys, &hk.trigger);
                 lines.push_str(&format!(
-                    "{ahk_key}:: {{\n    repeatDown[\"{poll_key}\"] := true\n{notify}    RepeatHold(\"{keys}\", {interval}, \"{poll_key}\", \"{repeat_exe}\", {hold}, \"{id}\")\n}}\n"
+                    "{ahk_key}:: {{\n    repeatDown[\"{poll_key}\"] := true\n{notify}    RepeatHold(\"{keys}\", {interval}, \"{poll_key}\", \"{repeat_exe}\", {hold}, \"{id}\", {use_windows_state})\n}}\n"
                 ));
                 // One global key-up hotkey per physical key clears the repeat flag. `~` lets the
                 // native key-up through so normal typing of the key still works; keyed by the bare
@@ -784,6 +788,26 @@ fn parse_pure_repeat(behavior: &str) -> Option<(String, u64, u64)> {
         return None;
     }
     Some((keys.to_string(), interval, hold))
+}
+
+fn repeat_output_uses_trigger(repeat_keys: &str, trigger: &str) -> bool {
+    let trigger_key = repeat_comparison_key(&trigger_bare_key(trigger));
+    !trigger_key.is_empty()
+        && repeat_keys
+            .split_whitespace()
+            .map(|part| repeat_comparison_key(&trigger_bare_key(part)))
+            .any(|repeat_key| repeat_key == trigger_key)
+}
+
+fn repeat_comparison_key(key: &str) -> String {
+    match key.to_ascii_lowercase().as_str() {
+        "control" | "lcontrol" | "rcontrol" => "control".to_string(),
+        "shift" | "lshift" | "rshift" => "shift".to_string(),
+        "alt" | "lalt" | "ralt" => "alt".to_string(),
+        "m1" => "lbutton".to_string(),
+        "m2" => "rbutton".to_string(),
+        key => key.to_string(),
+    }
 }
 
 /// The wildcard key-up hotkey that releases a held remap, e.g. trigger "shift win f23"
@@ -1370,13 +1394,15 @@ SpinHold(ms) {
 ; it, so there is only ever one loop and the rate is the interval, not the OS repeat rate.
 ; Each press holds the key down for exactly `holdMs` (precise busy-wait), tunable so a game
 ; that reads the key per frame can be made to register exactly one press per interval.
-RepeatHold(keys, interval, triggerKey, exe, holdMs, enabledKey) {
+RepeatHold(keys, interval, triggerKey, exe, holdMs, enabledKey, useWindowsState) {
     global enabled, repeatDown
     ; Stop as soon as EITHER release signal fires: the key-up hotkey clearing repeatDown, or
-    ; the physical-state poll. SendInput disables the keyboard hook while it sends, so a real
-    ; key-up landing in that window can be missed by one path and leave the key stuck "down";
-    ; requiring both to stay true means a miss on either one can no longer wedge the loop.
-    while ((repeatDown.Has(triggerKey) && repeatDown[triggerKey]) && GetKeyState(triggerKey, "P")) {
+    ; the independent Windows state poll. GetKeyState(..., "P") reads AutoHotkey's hook state,
+    ; so it can remain stale if the hook misses a release while SendInput has it uninstalled.
+    ; GetAsyncKeyState reads the current OS state instead of that same cached hook state. It is
+    ; skipped when the repeated output includes the trigger itself, because that synthetic input
+    ; legitimately changes the OS state; the key-up latch and hook state still cover that case.
+    while ((repeatDown.Has(triggerKey) && repeatDown[triggerKey]) && RepeatTriggerPhysicallyDown(triggerKey, useWindowsState)) {
         ; Pause (don't fire) while this profile is toggled off or its app is not focused —
         ; so the repeat can't leak into other apps — but keep looping until release.
         if (!enabled[enabledKey] || (exe != "" && !WinActive("ahk_exe " exe))) {
@@ -1390,11 +1416,31 @@ RepeatHold(keys, interval, triggerKey, exe, holdMs, enabledKey) {
             Sleep interval - elapsed
     }
     repeatDown[triggerKey] := false
+}
+
+RepeatTriggerPhysicallyDown(triggerKey, useWindowsState) {
+    static mouseButtonsSwapped := DllCall("GetSystemMetrics", "Int", 23)
+    if !GetKeyState(triggerKey, "P")
+        return false
+    if !useWindowsState
+        return true
+    vk := GetKeyVK(triggerKey)
+    if !vk
+        return false
+    ; AutoHotkey's L/RButton names mean primary/secondary, while GetAsyncKeyState's virtual
+    ; keys mean physical left/right. Translate them when Windows has swapped the mouse buttons.
+    if mouseButtonsSwapped {
+        if (triggerKey = "LButton")
+            vk := 0x02
+        else if (triggerKey = "RButton")
+            vk := 0x01
+    }
+    return (DllCall("GetAsyncKeyState", "Int", vk, "Short") & 0x8000) != 0
 }"###;
 
 #[cfg(test)]
 mod tests {
-    use super::generate_combined_script;
+    use super::{generate_combined_script, repeat_output_uses_trigger};
 
     #[test]
     fn combined_script_keeps_copilot_recovery_without_profiles() {
@@ -1416,5 +1462,27 @@ mod tests {
         assert!(script.contains("behaviorClipboardBackup := ClipboardAll()"));
         assert!(script.contains("SetTimer RestoreBehaviorClipboard, -500"));
         assert!(script.contains("OnExit RestoreBehaviorClipboard"));
+    }
+
+    #[test]
+    fn repeat_release_check_uses_independent_state_when_safe() {
+        let script = generate_combined_script(&[]);
+
+        assert!(script.contains("RepeatTriggerPhysicallyDown(triggerKey, useWindowsState)"));
+        assert!(script.contains("DllCall(\"GetAsyncKeyState\", \"Int\", vk, \"Short\") & 0x8000"));
+        assert!(script.contains("&& RepeatTriggerPhysicallyDown(triggerKey, useWindowsState)"));
+        assert!(script.contains("DllCall(\"GetSystemMetrics\", \"Int\", 23)"));
+        assert!(!script.contains("&& GetKeyState(triggerKey, \"P\")"));
+    }
+
+    #[test]
+    fn repeat_output_trigger_comparison_ignores_modifiers_and_case() {
+        assert!(repeat_output_uses_trigger("XButton1", "shift xbutton1"));
+        assert!(repeat_output_uses_trigger("f4", "CTRL F4"));
+        assert!(repeat_output_uses_trigger("ctrl f4", "ctrl"));
+        assert!(repeat_output_uses_trigger("lctrl f4", "ctrl"));
+        assert!(repeat_output_uses_trigger("m1", "LButton"));
+        assert!(!repeat_output_uses_trigger("f5", "ctrl f4"));
+        assert!(!repeat_output_uses_trigger("rctrl f5", "lctrl f4"));
     }
 }

@@ -1828,6 +1828,7 @@ export default function App() {
   // The version already announced via system notification, so the periodic re-check
   // doesn't toast the same release every 30 minutes.
   const notifiedUpdate = useRef<string | null>(null);
+  const launchUpdateCheckStarted = useRef(false);
   const { w: libW, onPointerDown: onResize } = useLibraryWidth();
 
   const loadDb = useCallback(async () => {
@@ -1877,10 +1878,18 @@ export default function App() {
     poll();
     const id = setInterval(poll, 2000);
 
-    // Check for updates on launch and periodically after: the app autostarts and lives in the
-    // tray for days, so a one-shot check would miss any release published while it stays open.
+    // An available update takes precedence over "Open to tray" at launch so the install banner
+    // is visible immediately. Later checks retain the normal tray behavior and use a notification.
     const backgroundCheck = () => { checkUpdate().catch(() => {}); };
-    backgroundCheck();
+    if (!launchUpdateCheckStarted.current) {
+      launchUpdateCheckStarted.current = true;
+      checkUpdate()
+        .then(latest => { if (latest) return api.revealMainWindow(); })
+        .catch(() => {});
+    }
+
+    // Keep checking periodically: the app can live in the tray for days, so a one-shot check
+    // would miss any release published while it stays open.
     const updateId = setInterval(backgroundCheck, 30 * 60 * 1000);
     // WebView2 throttles timers while the window is hidden in the tray, so the periodic
     // check can lag by an hour or more. Re-check whenever the window becomes visible so
