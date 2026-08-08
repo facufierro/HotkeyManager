@@ -419,6 +419,11 @@ fn show_main_window(app: &tauri::AppHandle) {
     });
 }
 
+#[tauri::command]
+fn reveal_main_window(app: tauri::AppHandle) {
+    show_main_window(&app);
+}
+
 fn hide_main_window(app: &tauri::AppHandle) {
     eprintln!("[tray] hide requested");
     if let Some(window) = main_window(app) {
@@ -1789,6 +1794,7 @@ pub fn run() {
             get_ahk_status,
             save_settings,
             get_app_version,
+            reveal_main_window,
             download_and_install_update,
         ])
         .run(tauri::generate_context!())
