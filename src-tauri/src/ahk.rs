@@ -307,8 +307,8 @@ fn generate_profile_block(
                 let poll_key = escape_ahk_string(&poll_key);
                 let repeat_exe = if global_game { String::new() } else { exe_esc.clone() };
                 // A synthetic up for the trigger itself also changes Windows' asynchronous
-                // state. Keep the existing hook-based check for that supported configuration;
-                // otherwise the independent OS state is safe to use as a missed-up fallback.
+                // state. Keep the hook installed for that configuration; otherwise the
+                // independent OS state is safe to use as a missed-up fallback.
                 let use_windows_state = !repeat_output_uses_trigger(&repeat_keys, &hk.trigger);
                 lines.push_str(&format!(
                     "{ahk_key}:: {{\n    repeatDown[\"{poll_key}\"] := true\n{notify}    RepeatHold(\"{keys}\", {interval}, \"{poll_key}\", \"{repeat_exe}\", {hold}, \"{id}\", {use_windows_state})\n}}\n"
@@ -1156,7 +1156,14 @@ TryGetViewportFromApp(&x, &y, &w, &h) {
     }
 }
 
-DoPress(keyStr, holdMs := 30, spin := false) {
+DoPress(keyStr, holdMs := 30, spin := false, preserveHooks := false) {
+    ; SendEvent keeps AutoHotkey's physical-input hooks installed. Same-key repeats need
+    ; that hook throughout every synthetic tap, because Windows' logical state is changed by
+    ; the tap itself and therefore cannot provide an independent release signal.
+    if preserveHooks {
+        SetKeyDelay -1, -1
+        SetMouseDelay -1
+    }
     mods := ""
     key  := ""
     for part in StrSplit(Trim(StrLower(keyStr)), " ") {
@@ -1193,29 +1200,29 @@ DoPress(keyStr, holdMs := 30, spin := false) {
     ; If no key was given, the modifier itself is the key to press
     if (key = "") {
         if (mods = "<^")
-            DoPressKey("LCtrl")
+            DoPressKey("LCtrl", preserveHooks)
         else if (mods = ">^")
-            DoPressKey("RCtrl")
+            DoPressKey("RCtrl", preserveHooks)
         else if (mods = "^")
-            DoPressKey("Ctrl")
+            DoPressKey("Ctrl", preserveHooks)
         else if (mods = "<+")
-            DoPressKey("LShift")
+            DoPressKey("LShift", preserveHooks)
         else if (mods = ">+")
-            DoPressKey("RShift")
+            DoPressKey("RShift", preserveHooks)
         else if (mods = "+")
-            DoPressKey("Shift")
+            DoPressKey("Shift", preserveHooks)
         else if (mods = "<!")
-            DoPressKey("LAlt")
+            DoPressKey("LAlt", preserveHooks)
         else if (mods = ">!")
-            DoPressKey("RAlt")
+            DoPressKey("RAlt", preserveHooks)
         else if (mods = "!")
-            DoPressKey("Alt")
+            DoPressKey("Alt", preserveHooks)
         else if (mods = "<#")
-            DoPressKey("LWin")
+            DoPressKey("LWin", preserveHooks)
         else if (mods = ">#")
-            DoPressKey("RWin")
+            DoPressKey("RWin", preserveHooks)
         else if (mods = "#")
-            DoPressKey("LWin")
+            DoPressKey("LWin", preserveHooks)
         return
     }
     ctrlKey := ""
@@ -1244,70 +1251,79 @@ DoPress(keyStr, holdMs := 30, spin := false) {
     altOwned := false
     try {
         ; Acquire inside the protected region so a failed send cannot strand an earlier modifier.
-        ctrlOwned := AcquireModifier(ctrlKey)
-        shiftOwned := AcquireModifier(shiftKey)
-        altOwned := AcquireModifier(altKey)
+        ctrlOwned := AcquireModifier(ctrlKey, preserveHooks)
+        shiftOwned := AcquireModifier(shiftKey, preserveHooks)
+        altOwned := AcquireModifier(altKey, preserveHooks)
         if (key = "m1" || key = "m2") {
             phys := (key = "m1") ? "LButton" : "RButton"
             wasHeld := GetKeyState(phys, "P")
             if wasHeld
-                SendInput("{Blind}{" phys " Up}")
+                SendKeyEvents("{Blind}{" phys " Up}", preserveHooks)
             Sleep 30
-            SendInput("{Blind}{" phys " Down}")
+            SendKeyEvents("{Blind}{" phys " Down}", preserveHooks)
             Sleep 30
-            SendInput("{Blind}{" phys " Up}")
-            if wasHeld
-                SendInput("{Blind}{" phys " Down}")
+            SendKeyEvents("{Blind}{" phys " Up}", preserveHooks)
+            ; With the hook preserved, do not restore a logical mouse-down after the user
+            ; physically released the button during this tap.
+            if (wasHeld && (!preserveHooks || GetKeyState(phys, "P")))
+                SendKeyEvents("{Blind}{" phys " Down}", preserveHooks)
             return
         }
         if (mods != "")
             Sleep 20
-        SendInput("{Blind}{" key " Down}")
+        SendKeyEvents("{Blind}{" key " Down}", preserveHooks)
         try {
             if (spin)
                 SpinHold(holdMs)  ; precise sub-Sleep-granularity hold for the repeat tap
             else
                 Sleep holdMs
         } finally {
-            SendInput("{Blind}{" key " Up}")  ; always release, even if the hold throws
+            SendKeyEvents("{Blind}{" key " Up}", preserveHooks)  ; always release, even if the hold throws
         }
         if (mods != "")
             Sleep 20
     } finally {
-        ReleaseModifier(altKey, altOwned)
-        ReleaseModifier(shiftKey, shiftOwned)
-        ReleaseModifier(ctrlKey, ctrlOwned)
+        ReleaseModifier(altKey, altOwned, preserveHooks)
+        ReleaseModifier(shiftKey, shiftOwned, preserveHooks)
+        ReleaseModifier(ctrlKey, ctrlOwned, preserveHooks)
     }
 }
 
-DoPressKey(keyName) {
+SendKeyEvents(keys, preserveHooks) {
+    if preserveHooks
+        SendEvent(keys)
+    else
+        SendInput(keys)
+}
+
+DoPressKey(keyName, preserveHooks := false) {
     if GetKeyState(keyName)
         return
-    SendInput("{Blind}{" keyName " DownTemp}")
+    SendKeyEvents("{Blind}{" keyName " DownTemp}", preserveHooks)
     try {
         Sleep 30
     } finally {
         if !GetKeyState(keyName, "P")
-            SendInput("{Blind}{" keyName " Up}")
+            SendKeyEvents("{Blind}{" keyName " Up}", preserveHooks)
     }
 }
 
 ; Acquire only modifier state that this action owns. A macro must never release a modifier
 ; which was already held by the user or by the Copilot remap.
-AcquireModifier(modKey) {
+AcquireModifier(modKey, preserveHooks := false) {
     if (modKey = "" || GetKeyState(modKey))
         return false
-    SendInput("{Blind}{" modKey " DownTemp}")
+    SendKeyEvents("{Blind}{" modKey " DownTemp}", preserveHooks)
     return true
 }
 
-ReleaseModifier(modKey, owned) {
+ReleaseModifier(modKey, owned, preserveHooks := false) {
     if !owned
         return
     ; If the user physically pressed it while the action ran, their eventual physical key-up
     ; owns the release; sending one here would cancel the real held modifier.
     if !GetKeyState(modKey, "P")
-        SendInput("{Blind}{" modKey " Up}")
+        SendKeyEvents("{Blind}{" modKey " Up}", preserveHooks)
 }
 
 ; A held remap. The press hotkey calls HoldKeyDown and a paired wildcard key-up
@@ -1403,14 +1419,15 @@ RepeatHold(keys, interval, triggerKey, exe, holdMs, enabledKey, useWindowsState)
     ; skipped when the repeated output includes the trigger itself, because that synthetic input
     ; legitimately changes the OS state; the key-up latch and hook state still cover that case.
     while ((repeatDown.Has(triggerKey) && repeatDown[triggerKey]) && RepeatTriggerPhysicallyDown(triggerKey, useWindowsState)) {
-        ; Pause (don't fire) while this profile is toggled off or its app is not focused —
-        ; so the repeat can't leak into other apps — but keep looping until release.
+        ; Toggling the profile off or leaving its target app ends this press. Retaining the
+        ; loop across a focus change lets a missed key-up leave a stale repeat ready to resume.
         if (!enabled[enabledKey] || (exe != "" && !WinActive("ahk_exe " exe))) {
-            Sleep 15
-            continue
+            break
         }
         start := A_TickCount
-        DoPress(keys, holdMs, true)
+        ; The independent Windows-state fallback is unsafe when the output contains the
+        ; trigger, so preserve the AHK hook for those taps instead.
+        DoPress(keys, holdMs, true, !useWindowsState)
         elapsed := A_TickCount - start
         if (elapsed < interval)
             Sleep interval - elapsed
@@ -1452,7 +1469,7 @@ mod tests {
         assert!(script.contains("#HotIf copilotState = \"waiting\"\n$*LShift::"));
         assert_eq!(script.matches("$*LShift::").count(), 1);
         assert!(!script.contains("$*LShift up::"));
-        assert!(script.contains("AcquireModifier(modKey)"));
+        assert!(script.contains("AcquireModifier(modKey, preserveHooks := false)"));
         assert!(script.contains("if (modKey = \"\" || GetKeyState(modKey))"));
         assert!(script.contains("if !GetKeyState(modKey, \"P\")"));
         assert!(!script.contains("SendModState("));
@@ -1472,7 +1489,21 @@ mod tests {
         assert!(script.contains("DllCall(\"GetAsyncKeyState\", \"Int\", vk, \"Short\") & 0x8000"));
         assert!(script.contains("&& RepeatTriggerPhysicallyDown(triggerKey, useWindowsState)"));
         assert!(script.contains("DllCall(\"GetSystemMetrics\", \"Int\", 23)"));
+        assert!(script.contains("DoPress(keys, holdMs, true, !useWindowsState)"));
+        assert!(script.contains("if preserveHooks\n        SendEvent(keys)"));
+        assert!(script.contains("SetKeyDelay -1, -1"));
+        assert!(script.contains("SetMouseDelay -1"));
         assert!(!script.contains("&& GetKeyState(triggerKey, \"P\")"));
+    }
+
+    #[test]
+    fn repeat_ends_when_its_profile_loses_authority() {
+        let script = generate_combined_script(&[]);
+
+        assert!(script.contains(
+            "if (!enabled[enabledKey] || (exe != \"\" && !WinActive(\"ahk_exe \" exe))) {\n            break"
+        ));
+        assert!(!script.contains("so the repeat can't leak into other apps"));
     }
 
     #[test]
