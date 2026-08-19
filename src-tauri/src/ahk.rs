@@ -321,7 +321,7 @@ fn generate_profile_block(
         if ahk_key.is_empty() { continue; }
         if !keyset.insert(ahk_key.clone()) { continue; }
         let trigger = escape_ahk_string(&hk.trigger);
-        let trigger_modifiers = trigger_modifier_keys(&hk.trigger).join(" ");
+        let trigger_modifiers = trigger_modifier_symbols(&hk.trigger);
         // The overlay only reacts to a hotkey_triggered ping for a binding that carries a
         // state_id (it drives overlay state flags/timers). For every other hotkey the ping is
         // a wasted blocking localhost round-trip on the hotkey's own thread — its first-call
@@ -338,7 +338,7 @@ fn generate_profile_block(
         if let (Some(hold_arg), Some(up_key)) = (parse_pure_hold(&hk.behavior), up_hotkey(&hk.trigger)) {
             let keys = escape_ahk_string(&hold_arg);
             lines.push_str(&format!(
-                "{ahk_key}:: {{\n    ReleaseTriggerModifiers(\"{trigger_modifiers}\")\n    HoldKeyDown(\"{keys}\")\n{notify}}}\n{up_key}:: HoldKeyUp(\"{keys}\")\n"
+                "{ahk_key}:: {{\n    HoldKeyDown(\"{keys}\", \"{trigger_modifiers}\")\n{notify}}}\n{up_key}:: HoldKeyUp(\"{keys}\", \"{trigger_modifiers}\")\n"
             ));
             continue;
         }
@@ -357,7 +357,7 @@ fn generate_profile_block(
                 // installed for every repeat regardless.
                 let use_windows_state = !repeat_output_uses_trigger(&repeat_keys, &hk.trigger);
                 lines.push_str(&format!(
-                    "{ahk_key}:: {{\n    ReleaseTriggerModifiers(\"{trigger_modifiers}\")\n    repeatDown[\"{poll_key}\"] := true\n{notify}    RepeatHold(\"{keys}\", {interval}, \"{poll_key}\", \"{repeat_exe}\", {hold}, \"{id}\", {use_windows_state})\n}}\n"
+                    "{ahk_key}:: {{\n    repeatDown[\"{poll_key}\"] := true\n{notify}    RepeatHold(\"{keys}\", {interval}, \"{poll_key}\", \"{repeat_exe}\", {hold}, \"{id}\", {use_windows_state}, \"{trigger_modifiers}\")\n}}\n"
                 ));
                 // One global key-up hotkey per physical key clears the repeat flag. `~` lets the
                 // native key-up through so normal typing of the key still works; keyed by the bare
@@ -376,7 +376,7 @@ fn generate_profile_block(
         // meaningful): the ping is a blocking localhost request, so doing it after keeps a
         // busy backend from delaying the output.
         lines.push_str(&format!(
-            "{ahk_key}:: {{\n    ReleaseTriggerModifiers(\"{trigger_modifiers}\")\n    ExecuteBehavior(\"{behavior}\")\n{notify}}}\n"
+            "{ahk_key}:: {{\n    ExecuteBehavior(\"{behavior}\", \"{trigger_modifiers}\")\n{notify}}}\n"
         ));
     }
 
@@ -876,26 +876,27 @@ fn repeat_comparison_key(key: &str) -> String {
     }
 }
 
-/// AHK key names for the modifiers in a trigger. They must be released before emitting the
-/// behavior, otherwise a combo such as LAlt+Left -> Home sends Alt+Home instead of Home.
-fn trigger_modifier_keys(trigger: &str) -> Vec<&'static str> {
-    trigger
-        .split_whitespace()
-        .filter_map(|part| match part.to_ascii_lowercase().as_str() {
-            "ctrl" => Some("Ctrl"),
-            "lctrl" => Some("LCtrl"),
-            "rctrl" => Some("RCtrl"),
-            "shift" => Some("Shift"),
-            "lshift" => Some("LShift"),
-            "rshift" => Some("RShift"),
-            "alt" => Some("Alt"),
-            "lalt" => Some("LAlt"),
-            "ralt" => Some("RAlt"),
-            "win" | "lwin" => Some("LWin"),
-            "rwin" => Some("RWin"),
-            _ => None,
-        })
-        .collect()
+/// AutoHotkey Blind-mode exclusions for modifiers contributed by a trigger. Exclusions suppress
+/// those modifiers only while output is sent, so a held trigger modifier remains usable for the
+/// next keypress. RAlt includes Ctrl because Windows implements AltGr as LCtrl+RAlt.
+fn trigger_modifier_symbols(trigger: &str) -> String {
+    let mut symbols = String::new();
+    for part in trigger.split_whitespace() {
+        let required = match part.to_ascii_lowercase().as_str() {
+            "ctrl" | "lctrl" | "rctrl" => "^",
+            "shift" | "lshift" | "rshift" => "+",
+            "alt" | "lalt" => "!",
+            "ralt" => "^!",
+            "win" | "lwin" | "rwin" => "#",
+            _ => "",
+        };
+        for symbol in required.chars() {
+            if !symbols.contains(symbol) {
+                symbols.push(symbol);
+            }
+        }
+    }
+    symbols
 }
 
 /// The wildcard key-up hotkey that releases a held remap, e.g. trigger "shift win f23"
@@ -1073,29 +1074,17 @@ PhysKey(key) {
     return key
 }
 
-; A hotkey's physical modifiers remain logically down while its handler runs. Neutralize them
-; before sending the configured behavior so they cannot leak into its output.
-ReleaseTriggerModifiers(modifiers) {
-    if (modifiers = "")
-        return
-    keys := "{Blind}"
-    ; Blind mode disables AutoHotkey's normal Alt/Win menu masking. Send its standard mask key
-    ; before releasing either modifier so the release cannot activate a window or Start menu.
-    if RegExMatch(modifiers, "i)(?:^| )(?:Alt|LAlt|RAlt|LWin|RWin)(?: |$)")
-        keys .= "{vk07}"
-    for modKey in StrSplit(modifiers, " ") {
-        if (modKey = "")
-            continue
-        keys .= "{" modKey " Up}"
-        ; Windows implements AltGr as a synthetic LCtrl held together with RAlt. Both halves
-        ; must be neutralized or RAlt hotkeys send Ctrl+target instead of the configured key.
-        if (modKey = "RAlt")
-            keys .= "{LCtrl Up}"
-    }
-    SendInput(keys)
+; Exclude only trigger modifiers which are absent from the output. AutoHotkey releases those
+; modifiers around this send and restores them immediately afterward, so holding a trigger
+; modifier continues to work for subsequent keypresses.
+BlindFor(triggerModifiers, outputModifiers := "") {
+    for symbol in ["^", "+", "!", "#"]
+        if InStr(outputModifiers, symbol)
+            triggerModifiers := StrReplace(triggerModifiers, symbol)
+    return "{Blind" triggerModifiers "}"
 }
 
-ExecuteBehavior(str) {
+ExecuteBehavior(str, triggerModifiers := "") {
     MouseGetPos &savedX, &savedY
     locked := false
     try {
@@ -1123,13 +1112,13 @@ ExecuteBehavior(str) {
                 MouseMove gameX + ResolveCoord(m[1], gameW), gameY + ResolveCoord(m[2], gameH), 0
             } else if RegExMatch(token, "i)^press\((.+)\)$", &m) {
                 for k in StrSplit(m[1], ",")
-                    DoPress(Trim(k))
+                    DoPress(Trim(k), 30, false, false, triggerModifiers)
                 Sleep 30
             } else if RegExMatch(token, "i)^repeat\((.+?),\s*(\d+)(?:,\s*\d+)?\)$", &m) {
-                DoPress(Trim(m[1]))
+                DoPress(Trim(m[1]), 30, false, false, triggerModifiers)
                 Sleep 30
             } else if RegExMatch(token, "i)^hold\((.+)\)$", &m) {
-                DoPress(Trim(m[1]))
+                DoPress(Trim(m[1]), 30, false, false, triggerModifiers)
             } else if RegExMatch(token, "i)^state\((.+)\)$", &m) {
                 SendAppEvent("state_triggered", "", Trim(m[1]))
             } else if RegExMatch(token, "i)^sleep\((\d+)\)$", &m) {
@@ -1266,7 +1255,7 @@ TryGetViewportFromApp(&x, &y, &w, &h) {
     }
 }
 
-DoPress(keyStr, holdMs := 30, spin := false, preserveHooks := false) {
+DoPress(keyStr, holdMs := 30, spin := false, preserveHooks := false, triggerModifiers := "") {
     ; SendEvent keeps AutoHotkey's physical-input hooks installed. Repeat taps need those
     ; hooks throughout every synthetic input so unrelated physical releases cannot disappear.
     if preserveHooks {
@@ -1306,6 +1295,7 @@ DoPress(keyStr, holdMs := 30, spin := false, preserveHooks := false) {
     if RegExMatch(key, "i)^f(\d+)$", &m)
         key := "F" m[1]
     key := PhysKey(key)
+    blind := BlindFor(triggerModifiers, mods)
     ; Mouse-button taps always preserve the mouse hook, even outside a repeat. Otherwise a
     ; physical button-up can race the tap's temporary logical-state restoration.
     if ((key = "m1" || key = "m2") && !preserveHooks) {
@@ -1316,29 +1306,29 @@ DoPress(keyStr, holdMs := 30, spin := false, preserveHooks := false) {
     ; If no key was given, the modifier itself is the key to press
     if (key = "") {
         if (mods = "<^")
-            DoPressKey("LCtrl", preserveHooks)
+            DoPressKey("LCtrl", preserveHooks, blind)
         else if (mods = ">^")
-            DoPressKey("RCtrl", preserveHooks)
+            DoPressKey("RCtrl", preserveHooks, blind)
         else if (mods = "^")
-            DoPressKey("Ctrl", preserveHooks)
+            DoPressKey("Ctrl", preserveHooks, blind)
         else if (mods = "<+")
-            DoPressKey("LShift", preserveHooks)
+            DoPressKey("LShift", preserveHooks, blind)
         else if (mods = ">+")
-            DoPressKey("RShift", preserveHooks)
+            DoPressKey("RShift", preserveHooks, blind)
         else if (mods = "+")
-            DoPressKey("Shift", preserveHooks)
+            DoPressKey("Shift", preserveHooks, blind)
         else if (mods = "<!")
-            DoPressKey("LAlt", preserveHooks)
+            DoPressKey("LAlt", preserveHooks, blind)
         else if (mods = ">!")
-            DoPressKey("RAlt", preserveHooks)
+            DoPressKey("RAlt", preserveHooks, blind)
         else if (mods = "!")
-            DoPressKey("Alt", preserveHooks)
+            DoPressKey("Alt", preserveHooks, blind)
         else if (mods = "<#")
-            DoPressKey("LWin", preserveHooks)
+            DoPressKey("LWin", preserveHooks, blind)
         else if (mods = ">#")
-            DoPressKey("RWin", preserveHooks)
+            DoPressKey("RWin", preserveHooks, blind)
         else if (mods = "#")
-            DoPressKey("LWin", preserveHooks)
+            DoPressKey("LWin", preserveHooks, blind)
         return
     }
     ctrlKey := ""
@@ -1367,22 +1357,22 @@ DoPress(keyStr, holdMs := 30, spin := false, preserveHooks := false) {
     altOwned := false
     try {
         ; Acquire inside the protected region so a failed send cannot strand an earlier modifier.
-        ctrlOwned := AcquireModifier(ctrlKey, preserveHooks)
-        shiftOwned := AcquireModifier(shiftKey, preserveHooks)
-        altOwned := AcquireModifier(altKey, preserveHooks)
+        ctrlOwned := AcquireModifier(ctrlKey, preserveHooks, blind)
+        shiftOwned := AcquireModifier(shiftKey, preserveHooks, blind)
+        altOwned := AcquireModifier(altKey, preserveHooks, blind)
         if (key = "m1" || key = "m2") {
             phys := (key = "m1") ? "LButton" : "RButton"
             wasHeld := GetKeyState(phys, "P")
             if mirroredMouseDown.Has(phys)
                 ReleaseMirroredMouse(phys, preserveHooks)
             else if wasHeld
-                SendKeyEvents("{Blind}{" phys " Up}", preserveHooks)
+                SendKeyEvents(blind "{" phys " Up}", preserveHooks)
             Sleep 30
-            SendOwnedKeyDown(phys, preserveHooks)
+            SendOwnedKeyDown(phys, preserveHooks, "Down", blind)
             try {
                 Sleep 30
             } finally {
-                SendOwnedKeyUp(phys, preserveHooks)
+                SendOwnedKeyUp(phys, preserveHooks, blind)
             }
             ; With the hook preserved, do not restore a logical mouse-down after the user
             ; physically released the button during this tap. The mirror remains owner-tracked
@@ -1393,21 +1383,21 @@ DoPress(keyStr, holdMs := 30, spin := false, preserveHooks := false) {
         }
         if (mods != "")
             Sleep 20
-        SendOwnedKeyDown(key, preserveHooks)
+        SendOwnedKeyDown(key, preserveHooks, "Down", blind)
         try {
             if (spin)
                 SpinHold(holdMs)  ; precise sub-Sleep-granularity hold for the repeat tap
             else
                 Sleep holdMs
         } finally {
-            SendOwnedKeyUp(key, preserveHooks)  ; always release, even if the hold throws
+            SendOwnedKeyUp(key, preserveHooks, blind)  ; always release, even if the hold throws
         }
         if (mods != "")
             Sleep 20
     } finally {
-        ReleaseModifier(altKey, altOwned, preserveHooks)
-        ReleaseModifier(shiftKey, shiftOwned, preserveHooks)
-        ReleaseModifier(ctrlKey, ctrlOwned, preserveHooks)
+        ReleaseModifier(altKey, altOwned, preserveHooks, blind)
+        ReleaseModifier(shiftKey, shiftOwned, preserveHooks, blind)
+        ReleaseModifier(ctrlKey, ctrlOwned, preserveHooks, blind)
     }
 }
 
@@ -1418,17 +1408,17 @@ SendKeyEvents(keys, preserveHooks) {
         SendInput(keys)
 }
 
-SendOwnedKeyDown(keyName, preserveHooks, downMode := "Down") {
+SendOwnedKeyDown(keyName, preserveHooks, downMode := "Down", blind := "{Blind}") {
     global syntheticDown
     ; Record ownership first so an ExitApp arriving between these statements can only cause
     ; a harmless extra key-up, never leave an unowned synthetic key-down behind.
     syntheticDown[keyName] := true
-    SendKeyEvents("{Blind}{" keyName " " downMode "}", preserveHooks)
+    SendKeyEvents(blind "{" keyName " " downMode "}", preserveHooks)
 }
 
-SendOwnedKeyUp(keyName, preserveHooks) {
+SendOwnedKeyUp(keyName, preserveHooks, blind := "{Blind}") {
     global syntheticDown
-    SendKeyEvents("{Blind}{" keyName " Up}", preserveHooks)
+    SendKeyEvents(blind "{" keyName " Up}", preserveHooks)
     if syntheticDown.Has(keyName)
         syntheticDown.Delete(keyName)
 }
@@ -1473,55 +1463,57 @@ CheckMirroredMouseReleases(*) {
         SetTimer CheckMirroredMouseReleases, 0
 }
 
-DoPressKey(keyName, preserveHooks := false) {
+DoPressKey(keyName, preserveHooks := false, blind := "{Blind}") {
     if GetKeyState(keyName)
         return
-    SendOwnedKeyDown(keyName, preserveHooks, "DownTemp")
+    SendOwnedKeyDown(keyName, preserveHooks, "DownTemp", blind)
     try {
         Sleep 30
     } finally {
         if !GetKeyState(keyName, "P")
-            SendOwnedKeyUp(keyName, preserveHooks)
+            SendOwnedKeyUp(keyName, preserveHooks, blind)
     }
 }
 
 ; Acquire only modifier state that this action owns. A macro must never release a modifier
 ; which was already held by the user or by the Copilot remap.
-AcquireModifier(modKey, preserveHooks := false) {
+AcquireModifier(modKey, preserveHooks := false, blind := "{Blind}") {
     if (modKey = "" || GetKeyState(modKey))
         return false
-    SendOwnedKeyDown(modKey, preserveHooks, "DownTemp")
+    SendOwnedKeyDown(modKey, preserveHooks, "DownTemp", blind)
     return true
 }
 
-ReleaseModifier(modKey, owned, preserveHooks := false) {
+ReleaseModifier(modKey, owned, preserveHooks := false, blind := "{Blind}") {
     if !owned
         return
     ; If the user physically pressed it while the action ran, their eventual physical key-up
     ; owns the release; sending one here would cancel the real held modifier.
     if !GetKeyState(modKey, "P")
-        SendOwnedKeyUp(modKey, preserveHooks)
+        SendOwnedKeyUp(modKey, preserveHooks, blind)
 }
 
 ; A held remap. The press hotkey calls HoldKeyDown and a paired wildcard key-up
 ; hotkey calls HoldKeyUp, so the key stays down for exactly as long as the trigger is
 ; held (e.g. a forced Copilot key behaving as Ctrl). This mirrors how AutoHotkey
 ; implements native key remapping:
-;   - {Blind} leaves unrelated physical modifiers untouched while sending; the trigger's
-;     configured modifiers were already neutralized by ReleaseTriggerModifiers.
+;   - Blind exclusions suppress trigger modifiers only for the output key event, then restore
+;     them so a held modifier can activate another hotkey without being pressed again.
 ;   - DownR re-presses the key on the hardware's auto-repeat so it stays down.
 ; A key-up hotkey is the only reliable release signal: the press hotkey suppresses
 ; the trigger, so its logical/physical state can't be polled for release.
-HoldKeyDown(keyStr) {
+HoldKeyDown(keyStr, triggerModifiers := "") {
+    blind := BlindFor(triggerModifiers, KeyModifierSymbols(keyStr))
     for k in HoldKeyList(keyStr)
-        SendOwnedKeyDown(k, true, "DownR")
+        SendOwnedKeyDown(k, true, "DownR", blind)
 }
 
-HoldKeyUp(keyStr) {
+HoldKeyUp(keyStr, triggerModifiers := "") {
     keys := HoldKeyList(keyStr)
+    blind := BlindFor(triggerModifiers, KeyModifierSymbols(keyStr))
     i := keys.Length
     while (i >= 1) {
-        SendOwnedKeyUp(keys[i], true)
+        SendOwnedKeyUp(keys[i], true, blind)
         i--
     }
 }
@@ -1564,6 +1556,21 @@ HoldKeyList(keyStr) {
     return held
 }
 
+KeyModifierSymbols(keyStr) {
+    symbols := ""
+    for part in StrSplit(Trim(StrLower(keyStr)), " ") {
+        if (part = "ctrl" || part = "lctrl" || part = "rctrl")
+            symbols .= "^"
+        else if (part = "shift" || part = "lshift" || part = "rshift")
+            symbols .= "+"
+        else if (part = "alt" || part = "lalt" || part = "ralt")
+            symbols .= "!"
+        else if (part = "win" || part = "lwin" || part = "rwin")
+            symbols .= "#"
+    }
+    return symbols
+}
+
 ; Busy-wait for `ms` milliseconds using the high-resolution performance counter. AHK's
 ; Sleep can't reliably hold a key for only a few ms (its granularity floors near 15ms),
 ; and a repeat aimed at a game that acts on a key every frame it is held needs the key
@@ -1588,7 +1595,7 @@ SpinHold(ms) {
 ; it, so there is only ever one loop and the rate is the interval, not the OS repeat rate.
 ; Each press holds the key down for exactly `holdMs` (precise busy-wait), tunable so a game
 ; that reads the key per frame can be made to register exactly one press per interval.
-RepeatHold(keys, interval, triggerKey, exe, holdMs, enabledKey, useWindowsState) {
+RepeatHold(keys, interval, triggerKey, exe, holdMs, enabledKey, useWindowsState, triggerModifiers := "") {
     global enabled, repeatDown
     ; Stop as soon as EITHER release signal fires: the key-up hotkey clearing repeatDown, or
     ; the independent Windows state poll. GetKeyState(..., "P") reads AutoHotkey's hook state,
@@ -1606,7 +1613,7 @@ RepeatHold(keys, interval, triggerKey, exe, holdMs, enabledKey, useWindowsState)
         start := A_TickCount
         ; Every repeat preserves both physical-input hooks. Besides keeping this trigger's
         ; release visible, that prevents an unrelated mouse/key release from being displaced.
-        DoPress(keys, holdMs, true, true)
+        DoPress(keys, holdMs, true, true, triggerModifiers)
         elapsed := A_TickCount - start
         if (elapsed < interval)
             Sleep interval - elapsed
@@ -1637,7 +1644,8 @@ RepeatTriggerPhysicallyDown(triggerKey, useWindowsState) {
 #[cfg(test)]
 mod tests {
     use super::{
-        generate_combined_script, repeat_output_uses_trigger, trigger_modifier_keys, ArmedProfile,
+        generate_combined_script, repeat_output_uses_trigger, trigger_modifier_symbols,
+        ArmedProfile,
     };
     use crate::config::{Hotkey, Profile};
 
@@ -1667,7 +1675,7 @@ mod tests {
     }
 
     #[test]
-    fn altgr_arrow_trigger_modifiers_are_released_before_press_behaviors() {
+    fn altgr_arrow_press_excludes_modifiers_without_releasing_the_held_trigger() {
         let mut profile = profile_with_hotkey("ralt left", "press(Home)");
         profile.hotkeys.push(Hotkey {
             name: String::new(),
@@ -1682,17 +1690,15 @@ mod tests {
         let script = generate_combined_script(&armed);
 
         assert!(script.contains(
-            "$*>!left:: {\n    ReleaseTriggerModifiers(\"RAlt\")\n    ExecuteBehavior(\"press(Home)\")"
+            "$*>!left:: {\n    ExecuteBehavior(\"press(Home)\", \"^!\")"
         ));
         assert!(script.contains(
-            "$*>!right:: {\n    ReleaseTriggerModifiers(\"RAlt\")\n    ExecuteBehavior(\"press(End)\")"
+            "$*>!right:: {\n    ExecuteBehavior(\"press(End)\", \"^!\")"
         ));
-        assert!(script.contains("keys .= \"{vk07}\""));
-        assert!(script.contains("if (modKey = \"RAlt\")\n            keys .= \"{LCtrl Up}\""));
-        assert_eq!(
-            trigger_modifier_keys("lctrl rshift lalt left"),
-            ["LCtrl", "RShift", "LAlt"]
-        );
+        assert!(script.contains("return \"{Blind\" triggerModifiers \"}\""));
+        assert!(!script.contains("ReleaseTriggerModifiers"));
+        assert_eq!(trigger_modifier_symbols("ralt left"), "^!");
+        assert_eq!(trigger_modifier_symbols("lctrl rshift lalt left"), "^+!");
     }
 
     #[test]
@@ -1707,7 +1713,9 @@ mod tests {
         assert!(script.contains("#HotIf copilotState = \"waiting\"\n$*LShift::"));
         assert_eq!(script.matches("$*LShift::").count(), 1);
         assert!(!script.contains("$*LShift up::"));
-        assert!(script.contains("AcquireModifier(modKey, preserveHooks := false)"));
+        assert!(script.contains(
+            "AcquireModifier(modKey, preserveHooks := false, blind := \"{Blind}\")"
+        ));
         assert!(script.contains("if (modKey = \"\" || GetKeyState(modKey))"));
         assert!(script.contains("if !GetKeyState(modKey, \"P\")"));
         assert!(!script.contains("SendModState("));
@@ -1727,7 +1735,7 @@ mod tests {
         assert!(script.contains("DllCall(\"GetAsyncKeyState\", \"Int\", vk, \"Short\") & 0x8000"));
         assert!(script.contains("&& RepeatTriggerPhysicallyDown(triggerKey, useWindowsState)"));
         assert!(script.contains("DllCall(\"GetSystemMetrics\", \"Int\", 23)"));
-        assert!(script.contains("DoPress(keys, holdMs, true, true)"));
+        assert!(script.contains("DoPress(keys, holdMs, true, true, triggerModifiers)"));
         assert!(script.contains("if preserveHooks\n        SendEvent(keys)"));
         assert!(script.contains("SetKeyDelay -1, -1"));
         assert!(script.contains("SetMouseDelay -1"));
@@ -1756,8 +1764,8 @@ mod tests {
         ));
         assert!(script.contains("syntheticDown[keyName] := true"));
         assert!(script.contains("if !GetKeyState(keyName, \"P\")\n            SendEvent"));
-        assert!(script.contains("SendOwnedKeyDown(k, true, \"DownR\")"));
-        assert!(script.contains("SendOwnedKeyUp(keys[i], true)"));
+        assert!(script.contains("SendOwnedKeyDown(k, true, \"DownR\", blind)"));
+        assert!(script.contains("SendOwnedKeyUp(keys[i], true, blind)"));
         assert!(script.contains("global mirroredMouseDown := Map()"));
         assert!(script.contains("MirrorPhysicalMouseDown(phys, preserveHooks)"));
         assert!(script.contains("SetTimer CheckMirroredMouseReleases, 10"));
