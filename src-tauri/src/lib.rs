@@ -125,7 +125,15 @@ struct OverlayEventPayload {
 static DEBUG_LOG_STATE: OnceLock<Mutex<HashMap<&'static str, String>>> = OnceLock::new();
 
 #[cfg(target_os = "windows")]
-static MOUSE_HOOK_HANDLE: OnceLock<Mutex<tauri::AppHandle>> = OnceLock::new();
+static MOUSE_HOOK_EVENTS: OnceLock<std::sync::mpsc::SyncSender<(i32, i32)>> = OnceLock::new();
+
+#[cfg(target_os = "windows")]
+fn is_physical_right_button_down(code: i32, message: u32, flags: u32) -> bool {
+    const LLMHF_INJECTED_FLAG: u32 = 0x0000_0001;
+    code >= 0
+        && message == winapi::um::winuser::WM_RBUTTONDOWN
+        && flags & LLMHF_INJECTED_FLAG == 0
+}
 
 #[cfg(target_os = "windows")]
 unsafe extern "system" fn mouse_hook_proc(
@@ -133,18 +141,14 @@ unsafe extern "system" fn mouse_hook_proc(
     wparam: usize,
     lparam: isize,
 ) -> isize {
-    use winapi::um::winuser::{CallNextHookEx, WM_RBUTTONDOWN, MSLLHOOKSTRUCT};
-    if code >= 0 && wparam as u32 == WM_RBUTTONDOWN {
+    use winapi::um::winuser::{CallNextHookEx, MSLLHOOKSTRUCT};
+    if code >= 0 {
         let ms = &*(lparam as *const MSLLHOOKSTRUCT);
-        let x = ms.pt.x;
-        let y = ms.pt.y;
-        if let Some(handle_lock) = MOUSE_HOOK_HANDLE.get() {
-            if let Ok(handle) = handle_lock.lock() {
-                if let Some(overlay) = handle.get_webview_window("overlay") {
-                    if overlay.is_visible().unwrap_or(false) {
-                        let _ = overlay.emit("overlay-right-click", (x, y));
-                    }
-                }
+        if is_physical_right_button_down(code, wparam as u32, ms.flags) {
+            if let Some(events) = MOUSE_HOOK_EVENTS.get() {
+                // A low-level hook blocks Windows' input queue until it returns. Never call
+                // WebView/Tauri APIs here; drop excess UI events instead of delaying input.
+                let _ = events.try_send((ms.pt.x, ms.pt.y));
             }
         }
     }
@@ -154,7 +158,19 @@ unsafe extern "system" fn mouse_hook_proc(
 #[cfg(target_os = "windows")]
 fn start_mouse_hook(handle: tauri::AppHandle) {
     use winapi::um::winuser::{SetWindowsHookExW, WH_MOUSE_LL};
-    let _ = MOUSE_HOOK_HANDLE.set(Mutex::new(handle));
+    let (events, pending_events) = std::sync::mpsc::sync_channel(16);
+    if MOUSE_HOOK_EVENTS.set(events).is_err() {
+        return;
+    }
+    std::thread::spawn(move || {
+        while let Ok((x, y)) = pending_events.recv() {
+            if let Some(overlay) = handle.get_webview_window("overlay") {
+                if overlay.is_visible().unwrap_or(false) {
+                    let _ = overlay.emit("overlay-right-click", (x, y));
+                }
+            }
+        }
+    });
     std::thread::spawn(|| unsafe {
         use winapi::um::winuser::{GetMessageW, TranslateMessage, DispatchMessageW, MSG};
         SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), std::ptr::null_mut(), 0);
@@ -164,6 +180,20 @@ fn start_mouse_hook(handle: tauri::AppHandle) {
             DispatchMessageW(&msg);
         }
     });
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod mouse_hook_tests {
+    use super::is_physical_right_button_down;
+    use winapi::um::winuser::WM_RBUTTONDOWN;
+
+    #[test]
+    fn only_physical_right_button_down_is_forwarded() {
+        assert!(is_physical_right_button_down(0, WM_RBUTTONDOWN, 0));
+        assert!(!is_physical_right_button_down(-1, WM_RBUTTONDOWN, 0));
+        assert!(!is_physical_right_button_down(0, WM_RBUTTONDOWN, 1));
+        assert!(!is_physical_right_button_down(0, WM_RBUTTONDOWN + 1, 0));
+    }
 }
 
 #[cfg(target_os = "windows")]
