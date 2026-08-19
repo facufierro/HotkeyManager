@@ -36,7 +36,7 @@ if (-not $gitTag) {
         }
     )
     if (-not $changelogs) {
-        throw "No changelog found in changelog\. Create changelog\v<next>.md first (see CLAUDE.md)."
+        throw "No changelog found in changelog\. Create changelog\v<next>.md first (see AGENTS.md)."
     }
     $unreleased = @($changelogs | Where-Object { -not $_.IsReleased } | Sort-Object Version -Descending)
     if ($unreleased.Count) {
