@@ -321,6 +321,7 @@ fn generate_profile_block(
         if ahk_key.is_empty() { continue; }
         if !keyset.insert(ahk_key.clone()) { continue; }
         let trigger = escape_ahk_string(&hk.trigger);
+        let trigger_modifiers = trigger_modifier_keys(&hk.trigger).join(" ");
         // The overlay only reacts to a hotkey_triggered ping for a binding that carries a
         // state_id (it drives overlay state flags/timers). For every other hotkey the ping is
         // a wasted blocking localhost round-trip on the hotkey's own thread — its first-call
@@ -337,7 +338,7 @@ fn generate_profile_block(
         if let (Some(hold_arg), Some(up_key)) = (parse_pure_hold(&hk.behavior), up_hotkey(&hk.trigger)) {
             let keys = escape_ahk_string(&hold_arg);
             lines.push_str(&format!(
-                "{ahk_key}:: {{\n    HoldKeyDown(\"{keys}\")\n{notify}}}\n{up_key}:: HoldKeyUp(\"{keys}\")\n"
+                "{ahk_key}:: {{\n    ReleaseTriggerModifiers(\"{trigger_modifiers}\")\n    HoldKeyDown(\"{keys}\")\n{notify}}}\n{up_key}:: HoldKeyUp(\"{keys}\")\n"
             ));
             continue;
         }
@@ -356,7 +357,7 @@ fn generate_profile_block(
                 // installed for every repeat regardless.
                 let use_windows_state = !repeat_output_uses_trigger(&repeat_keys, &hk.trigger);
                 lines.push_str(&format!(
-                    "{ahk_key}:: {{\n    repeatDown[\"{poll_key}\"] := true\n{notify}    RepeatHold(\"{keys}\", {interval}, \"{poll_key}\", \"{repeat_exe}\", {hold}, \"{id}\", {use_windows_state})\n}}\n"
+                    "{ahk_key}:: {{\n    ReleaseTriggerModifiers(\"{trigger_modifiers}\")\n    repeatDown[\"{poll_key}\"] := true\n{notify}    RepeatHold(\"{keys}\", {interval}, \"{poll_key}\", \"{repeat_exe}\", {hold}, \"{id}\", {use_windows_state})\n}}\n"
                 ));
                 // One global key-up hotkey per physical key clears the repeat flag. `~` lets the
                 // native key-up through so normal typing of the key still works; keyed by the bare
@@ -375,7 +376,7 @@ fn generate_profile_block(
         // meaningful): the ping is a blocking localhost request, so doing it after keeps a
         // busy backend from delaying the output.
         lines.push_str(&format!(
-            "{ahk_key}:: {{\n    ExecuteBehavior(\"{behavior}\")\n{notify}}}\n"
+            "{ahk_key}:: {{\n    ReleaseTriggerModifiers(\"{trigger_modifiers}\")\n    ExecuteBehavior(\"{behavior}\")\n{notify}}}\n"
         ));
     }
 
@@ -637,8 +638,8 @@ CopilotKeyPhysicallyDown() {{
 }}
 
 ReleaseStaleCopilotModifiers() {{
-    if !GetKeyState("RCtrl", "P") && !CopilotKeyPhysicallyDown()
-        SendInput "{{Blind}}{{RCtrl up}}"
+    if !GetKeyState("LCtrl", "P") && !CopilotKeyPhysicallyDown()
+        SendInput "{{Blind}}{{LCtrl up}}"
     if !GetKeyState("LWin", "P")
         SendInput "{{Blind}}{{LWin up}}"
     if !GetKeyState("LShift", "P")
@@ -650,22 +651,22 @@ ReleaseCopilotCtrl() {{
     if !copilotCtrlHeld
         return
     copilotCtrlHeld := false
-    ; Do not cancel a real Right Ctrl which happens to be held at the same time. Keep the
+    ; Do not cancel a real Left Ctrl which happens to be held at the same time. Keep the
     ; poll alive and clear our synthetic DownR immediately after the physical key is released.
-    if GetKeyState("RCtrl", "P") {{
+    if GetKeyState("LCtrl", "P") {{
         copilotCtrlReleasePending := true
     }} else {{
         copilotCtrlReleasePending := false
         SetTimer CheckCopilotRelease, 0
-        SendInput "{{Blind}}{{RCtrl up}}"
+        SendInput "{{Blind}}{{LCtrl up}}"
     }}
 }}
 
 ReleaseCopilotHeld(*) {{
     global copilotCtrlReleasePending, copilotShiftForwarded
     ReleaseCopilotCtrl()
-    if copilotCtrlReleasePending && !GetKeyState("RCtrl", "P")
-        SendInput "{{Blind}}{{RCtrl up}}"
+    if copilotCtrlReleasePending && !GetKeyState("LCtrl", "P")
+        SendInput "{{Blind}}{{LCtrl up}}"
     copilotCtrlReleasePending := false
     copilotShiftForwarded := false
     if !GetKeyState("LWin", "P")
@@ -678,10 +679,10 @@ CheckCopilotRelease(*) {{
     global copilotCtrlHeld, copilotCtrlReleasePending
     if copilotCtrlHeld && !CopilotKeyPhysicallyDown()
         ReleaseCopilotCtrl()
-    if copilotCtrlReleasePending && !GetKeyState("RCtrl", "P") {{
+    if copilotCtrlReleasePending && !GetKeyState("LCtrl", "P") {{
         copilotCtrlReleasePending := false
         SetTimer CheckCopilotRelease, 0
-        SendInput "{{Blind}}{{RCtrl up}}"
+        SendInput "{{Blind}}{{LCtrl up}}"
     }}
 }}
 
@@ -769,7 +770,7 @@ $*SC06E::{{
         return
     copilotCtrlHeld := true
     copilotCtrlReleasePending := false
-    SendInput "{{Blind}}{{RCtrl downR}}"
+    SendInput "{{Blind}}{{LCtrl downR}}"
     SetTimer CheckCopilotRelease, 10
 }}
 
@@ -873,6 +874,28 @@ fn repeat_comparison_key(key: &str) -> String {
         "m2" => "rbutton".to_string(),
         key => key.to_string(),
     }
+}
+
+/// AHK key names for the modifiers in a trigger. They must be released before emitting the
+/// behavior, otherwise a combo such as LAlt+Left -> Home sends Alt+Home instead of Home.
+fn trigger_modifier_keys(trigger: &str) -> Vec<&'static str> {
+    trigger
+        .split_whitespace()
+        .filter_map(|part| match part.to_ascii_lowercase().as_str() {
+            "ctrl" => Some("Ctrl"),
+            "lctrl" => Some("LCtrl"),
+            "rctrl" => Some("RCtrl"),
+            "shift" => Some("Shift"),
+            "lshift" => Some("LShift"),
+            "rshift" => Some("RShift"),
+            "alt" => Some("Alt"),
+            "lalt" => Some("LAlt"),
+            "ralt" => Some("RAlt"),
+            "win" | "lwin" => Some("LWin"),
+            "rwin" => Some("RWin"),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The wildcard key-up hotkey that releases a held remap, e.g. trigger "shift win f23"
@@ -1048,6 +1071,28 @@ PhysKey(key) {
         return sc[key]
     }
     return key
+}
+
+; A hotkey's physical modifiers remain logically down while its handler runs. Neutralize them
+; before sending the configured behavior so they cannot leak into its output.
+ReleaseTriggerModifiers(modifiers) {
+    if (modifiers = "")
+        return
+    keys := "{Blind}"
+    ; Blind mode disables AutoHotkey's normal Alt/Win menu masking. Send its standard mask key
+    ; before releasing either modifier so the release cannot activate a window or Start menu.
+    if RegExMatch(modifiers, "i)(?:^| )(?:Alt|LAlt|RAlt|LWin|RWin)(?: |$)")
+        keys .= "{vk07}"
+    for modKey in StrSplit(modifiers, " ") {
+        if (modKey = "")
+            continue
+        keys .= "{" modKey " Up}"
+        ; Windows implements AltGr as a synthetic LCtrl held together with RAlt. Both halves
+        ; must be neutralized or RAlt hotkeys send Ctrl+target instead of the configured key.
+        if (modKey = "RAlt")
+            keys .= "{LCtrl Up}"
+    }
+    SendInput(keys)
 }
 
 ExecuteBehavior(str) {
@@ -1462,7 +1507,8 @@ ReleaseModifier(modKey, owned, preserveHooks := false) {
 ; hotkey calls HoldKeyUp, so the key stays down for exactly as long as the trigger is
 ; held (e.g. a forced Copilot key behaving as Ctrl). This mirrors how AutoHotkey
 ; implements native key remapping:
-;   - {Blind} leaves the trigger's own modifiers untouched while sending.
+;   - {Blind} leaves unrelated physical modifiers untouched while sending; the trigger's
+;     configured modifiers were already neutralized by ReleaseTriggerModifiers.
 ;   - DownR re-presses the key on the hardware's auto-repeat so it stays down.
 ; A key-up hotkey is the only reliable release signal: the press hotkey suppresses
 ; the trigger, so its logical/physical state can't be polled for release.
@@ -1590,13 +1636,72 @@ RepeatTriggerPhysicallyDown(triggerKey, useWindowsState) {
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_combined_script, repeat_output_uses_trigger};
+    use super::{
+        generate_combined_script, repeat_output_uses_trigger, trigger_modifier_keys, ArmedProfile,
+    };
+    use crate::config::{Hotkey, Profile};
+
+    fn profile_with_hotkey(trigger: &str, behavior: &str) -> Profile {
+        Profile {
+            id: "test-profile".to_string(),
+            name: "Test".to_string(),
+            kind: "hotkeys".to_string(),
+            exe: "*".to_string(),
+            armed: true,
+            parent_id: None,
+            hotkeys: vec![Hotkey {
+                name: String::new(),
+                trigger: trigger.to_string(),
+                behavior: behavior.to_string(),
+                state_id: None,
+            }],
+            states: Vec::new(),
+            overlay_items: Vec::new(),
+            overlay_triggers: Vec::new(),
+            overlay_groups: Vec::new(),
+            scripts: Vec::new(),
+            overlay_disabled: false,
+            toggle_hotkeys_key: None,
+            toggle_overlay_key: None,
+        }
+    }
+
+    #[test]
+    fn altgr_arrow_trigger_modifiers_are_released_before_press_behaviors() {
+        let mut profile = profile_with_hotkey("ralt left", "press(Home)");
+        profile.hotkeys.push(Hotkey {
+            name: String::new(),
+            trigger: "ralt right".to_string(),
+            behavior: "press(End)".to_string(),
+            state_id: None,
+        });
+        let armed = [ArmedProfile {
+            siblings: std::slice::from_ref(&profile),
+            profile: &profile,
+        }];
+        let script = generate_combined_script(&armed);
+
+        assert!(script.contains(
+            "$*>!left:: {\n    ReleaseTriggerModifiers(\"RAlt\")\n    ExecuteBehavior(\"press(Home)\")"
+        ));
+        assert!(script.contains(
+            "$*>!right:: {\n    ReleaseTriggerModifiers(\"RAlt\")\n    ExecuteBehavior(\"press(End)\")"
+        ));
+        assert!(script.contains("keys .= \"{vk07}\""));
+        assert!(script.contains("if (modKey = \"RAlt\")\n            keys .= \"{LCtrl Up}\""));
+        assert_eq!(
+            trigger_modifier_keys("lctrl rshift lalt left"),
+            ["LCtrl", "RShift", "LAlt"]
+        );
+    }
 
     #[test]
     fn combined_script_keeps_copilot_recovery_without_profiles() {
         let script = generate_combined_script(&[]);
 
         assert!(script.contains("$*SC06E::"));
+        assert!(script.contains("SendInput \"{Blind}{LCtrl downR}\""));
+        assert!(!script.contains("SendInput \"{Blind}{RCtrl downR}\""));
         assert!(script.contains("SetTimer CheckCopilotRelease, 10"));
         assert!(script.contains("GetAsyncKeyState"));
         assert!(script.contains("#HotIf copilotState = \"waiting\"\n$*LShift::"));
