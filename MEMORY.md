@@ -12,7 +12,7 @@ Tauri v2 app (React/TS frontend, Rust backend) that manages per-app hotkey/overl
 
 ## Features
 - Per-app profiles gated by `WinActive("ahk_exe …")`; "Any app" profile (exe `*`) always exists and must never be deleted.
-- Hotkey behaviors: press/hold (true remap)/repeat (hold-to-repeat)/goto/sleep/send/state; trigger modifiers are neutralized before behavior output so they cannot leak into remapped keys; toggle keys per profile.
+- Hotkey behaviors: press/hold (true remap)/repeat (hold-to-repeat)/goto/sleep/send/state; trigger modifiers are excluded only during behavior output so they cannot leak into remapped keys and remain held for subsequent hotkeys; toggle keys per profile.
 - Layout-independent hotkeys: triggers and sent single-char keys are emitted as US-QWERTY scancodes (`us_scancode` in ahk.rs, `PhysKey` in the AHK engine) so non-English layouts work.
 - The Copilot key → Left Ctrl remap and profile hotkeys share one persistent AHK process, so keyboard-hook recovery and synthesized modifier state have a single owner.
 - Keyboard-hook health check + reinstall on wake so hotkeys survive sleep/tray idling.
