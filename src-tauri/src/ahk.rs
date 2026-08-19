@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+#[cfg(target_os = "windows")]
+use std::time::{Duration, Instant};
 
 use crate::config::{self, Profile};
 
@@ -82,6 +84,54 @@ fn keep_process_responsive(child: &Child) {
     unsafe { SetPriorityClass(handle, ABOVE_NORMAL_PRIORITY_CLASS); }
 }
 
+/// Ask AutoHotkey's hidden main window to close so its OnExit input cleanup runs. Returns
+/// false when no window for this child exists, in which case waiting cannot help.
+#[cfg(target_os = "windows")]
+fn request_graceful_exit(child: &Child) -> bool {
+    use winapi::shared::minwindef::{BOOL, DWORD, LPARAM, TRUE};
+    use winapi::shared::windef::HWND;
+    use winapi::um::winuser::{EnumWindows, GetWindowThreadProcessId, PostMessageW, WM_CLOSE};
+
+    struct ExitRequest {
+        pid: DWORD,
+        posted: bool,
+    }
+
+    unsafe extern "system" fn enum_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let request = &mut *(lparam as *mut ExitRequest);
+        let mut window_pid = 0;
+        GetWindowThreadProcessId(hwnd, &mut window_pid);
+        if window_pid == request.pid && PostMessageW(hwnd, WM_CLOSE, 0, 0) != 0 {
+            request.posted = true;
+        }
+        TRUE
+    }
+
+    let mut request = ExitRequest {
+        pid: child.id(),
+        posted: false,
+    };
+    unsafe { EnumWindows(Some(enum_window), &mut request as *mut _ as LPARAM); }
+    request.posted
+}
+
+fn stop_process(mut child: Child) {
+    #[cfg(target_os = "windows")]
+    if request_graceful_exit(&child) {
+        let deadline = Instant::now() + Duration::from_millis(750);
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(_) => break,
+            }
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Opt a process out of Windows EcoQoS "Efficiency Mode" power throttling. Idle in the tray with
 /// no visible window, Windows throttles the app — and Efficiency Mode extends across the process
 /// tree to the child AutoHotkey process that dispatches hotkeys. A throttled process's low-level
@@ -148,13 +198,9 @@ impl AhkManager {
     }
 
     pub fn launch(&mut self, ahk_exe: &str, script_path: &Path) -> Result<(), String> {
-        // Kill old process in the background so we don't block waiting for it to exit.
-        // AHK's #SingleInstance Force also causes the old instance to exit on its own.
-        if let Some(mut old) = self.process.take() {
-            std::thread::spawn(move || {
-                let _ = old.kill();
-                let _ = old.wait();
-            });
+        // Let the old script release every synthetic input it owns before replacing it.
+        if let Some(old) = self.process.take() {
+            stop_process(old);
         }
 
         // AutoHotkeyUX.exe is a launcher that spawns a child and exits — use the v2
@@ -184,9 +230,8 @@ impl AhkManager {
     }
 
     pub fn kill(&mut self) {
-        if let Some(mut child) = self.process.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(child) = self.process.take() {
+            stop_process(child);
         }
     }
 
@@ -307,8 +352,8 @@ fn generate_profile_block(
                 let poll_key = escape_ahk_string(&poll_key);
                 let repeat_exe = if global_game { String::new() } else { exe_esc.clone() };
                 // A synthetic up for the trigger itself also changes Windows' asynchronous
-                // state. Keep the existing hook-based check for that supported configuration;
-                // otherwise the independent OS state is safe to use as a missed-up fallback.
+                // state, so skip that fallback for same-trigger output. The AHK hook remains
+                // installed for every repeat regardless.
                 let use_windows_state = !repeat_output_uses_trigger(&repeat_keys, &hk.trigger);
                 lines.push_str(&format!(
                     "{ahk_key}:: {{\n    repeatDown[\"{poll_key}\"] := true\n{notify}    RepeatHold(\"{keys}\", {interval}, \"{poll_key}\", \"{repeat_exe}\", {hold}, \"{id}\", {use_windows_state})\n}}\n"
@@ -421,6 +466,8 @@ global overlayVisible := false
 global overlayProfiles := []
 global lastFocusId := ""
 global repeatDown := Map()
+global syntheticDown := Map()
+global mirroredMouseDown := Map()
 global copilotState := "idle"
 global copilotShiftSuppressed := false
 global copilotShiftForwarded := false
@@ -429,8 +476,9 @@ global copilotCtrlReleasePending := false
 global behaviorClipboardBackup := ""
 global behaviorClipboardPending := false
 global behaviorClipboardSequence := 0
-{enabled_init}{overlay_init}OnExit HideOverlayOnExit
+{enabled_init}{overlay_init}OnExit ReleaseSyntheticHeld
 OnExit ReleaseCopilotHeld
+OnExit HideOverlayOnExit
 OnExit RestoreBehaviorClipboard
 
 SendOverlayCommand(path) {{
@@ -545,6 +593,23 @@ CheckHookHealth(*) {{
     }}
 }}
 SetTimer CheckHookHealth, 1000
+
+; The key-up hotkey is the primary release signal. This independent owner-scoped monitor
+; clears a repeat if that hotkey is ever delayed or displaced by another hook callback.
+CheckRepeatReleases(*) {{
+    global repeatDown
+    anyDown := false
+    for triggerKey, down in repeatDown {{
+        if !down
+            continue
+        if GetKeyState(triggerKey, "P")
+            anyDown := true
+        else
+            repeatDown[triggerKey] := false
+    }}
+    if !anyDown
+        SetTimer CheckRepeatReleases, 0
+}}
 
 ; A previous force-terminated instance can leave synthesized modifiers logically down.
 ; Clear only keys which are not physically held, so startup cannot cancel real input.
@@ -1156,7 +1221,13 @@ TryGetViewportFromApp(&x, &y, &w, &h) {
     }
 }
 
-DoPress(keyStr, holdMs := 30, spin := false) {
+DoPress(keyStr, holdMs := 30, spin := false, preserveHooks := false) {
+    ; SendEvent keeps AutoHotkey's physical-input hooks installed. Repeat taps need those
+    ; hooks throughout every synthetic input so unrelated physical releases cannot disappear.
+    if preserveHooks {
+        SetKeyDelay -1, -1
+        SetMouseDelay -1
+    }
     mods := ""
     key  := ""
     for part in StrSplit(Trim(StrLower(keyStr)), " ") {
@@ -1190,32 +1261,39 @@ DoPress(keyStr, holdMs := 30, spin := false) {
     if RegExMatch(key, "i)^f(\d+)$", &m)
         key := "F" m[1]
     key := PhysKey(key)
+    ; Mouse-button taps always preserve the mouse hook, even outside a repeat. Otherwise a
+    ; physical button-up can race the tap's temporary logical-state restoration.
+    if ((key = "m1" || key = "m2") && !preserveHooks) {
+        preserveHooks := true
+        SetKeyDelay -1, -1
+        SetMouseDelay -1
+    }
     ; If no key was given, the modifier itself is the key to press
     if (key = "") {
         if (mods = "<^")
-            DoPressKey("LCtrl")
+            DoPressKey("LCtrl", preserveHooks)
         else if (mods = ">^")
-            DoPressKey("RCtrl")
+            DoPressKey("RCtrl", preserveHooks)
         else if (mods = "^")
-            DoPressKey("Ctrl")
+            DoPressKey("Ctrl", preserveHooks)
         else if (mods = "<+")
-            DoPressKey("LShift")
+            DoPressKey("LShift", preserveHooks)
         else if (mods = ">+")
-            DoPressKey("RShift")
+            DoPressKey("RShift", preserveHooks)
         else if (mods = "+")
-            DoPressKey("Shift")
+            DoPressKey("Shift", preserveHooks)
         else if (mods = "<!")
-            DoPressKey("LAlt")
+            DoPressKey("LAlt", preserveHooks)
         else if (mods = ">!")
-            DoPressKey("RAlt")
+            DoPressKey("RAlt", preserveHooks)
         else if (mods = "!")
-            DoPressKey("Alt")
+            DoPressKey("Alt", preserveHooks)
         else if (mods = "<#")
-            DoPressKey("LWin")
+            DoPressKey("LWin", preserveHooks)
         else if (mods = ">#")
-            DoPressKey("RWin")
+            DoPressKey("RWin", preserveHooks)
         else if (mods = "#")
-            DoPressKey("LWin")
+            DoPressKey("LWin", preserveHooks)
         return
     }
     ctrlKey := ""
@@ -1244,70 +1322,140 @@ DoPress(keyStr, holdMs := 30, spin := false) {
     altOwned := false
     try {
         ; Acquire inside the protected region so a failed send cannot strand an earlier modifier.
-        ctrlOwned := AcquireModifier(ctrlKey)
-        shiftOwned := AcquireModifier(shiftKey)
-        altOwned := AcquireModifier(altKey)
+        ctrlOwned := AcquireModifier(ctrlKey, preserveHooks)
+        shiftOwned := AcquireModifier(shiftKey, preserveHooks)
+        altOwned := AcquireModifier(altKey, preserveHooks)
         if (key = "m1" || key = "m2") {
             phys := (key = "m1") ? "LButton" : "RButton"
             wasHeld := GetKeyState(phys, "P")
-            if wasHeld
-                SendInput("{Blind}{" phys " Up}")
+            if mirroredMouseDown.Has(phys)
+                ReleaseMirroredMouse(phys, preserveHooks)
+            else if wasHeld
+                SendKeyEvents("{Blind}{" phys " Up}", preserveHooks)
             Sleep 30
-            SendInput("{Blind}{" phys " Down}")
-            Sleep 30
-            SendInput("{Blind}{" phys " Up}")
-            if wasHeld
-                SendInput("{Blind}{" phys " Down}")
+            SendOwnedKeyDown(phys, preserveHooks)
+            try {
+                Sleep 30
+            } finally {
+                SendOwnedKeyUp(phys, preserveHooks)
+            }
+            ; With the hook preserved, do not restore a logical mouse-down after the user
+            ; physically released the button during this tap. The mirror remains owner-tracked
+            ; so a release racing this check is still observed and forwarded as an up.
+            if (wasHeld && GetKeyState(phys, "P"))
+                MirrorPhysicalMouseDown(phys, preserveHooks)
             return
         }
         if (mods != "")
             Sleep 20
-        SendInput("{Blind}{" key " Down}")
+        SendOwnedKeyDown(key, preserveHooks)
         try {
             if (spin)
                 SpinHold(holdMs)  ; precise sub-Sleep-granularity hold for the repeat tap
             else
                 Sleep holdMs
         } finally {
-            SendInput("{Blind}{" key " Up}")  ; always release, even if the hold throws
+            SendOwnedKeyUp(key, preserveHooks)  ; always release, even if the hold throws
         }
         if (mods != "")
             Sleep 20
     } finally {
-        ReleaseModifier(altKey, altOwned)
-        ReleaseModifier(shiftKey, shiftOwned)
-        ReleaseModifier(ctrlKey, ctrlOwned)
+        ReleaseModifier(altKey, altOwned, preserveHooks)
+        ReleaseModifier(shiftKey, shiftOwned, preserveHooks)
+        ReleaseModifier(ctrlKey, ctrlOwned, preserveHooks)
     }
 }
 
-DoPressKey(keyName) {
+SendKeyEvents(keys, preserveHooks) {
+    if preserveHooks
+        SendEvent(keys)
+    else
+        SendInput(keys)
+}
+
+SendOwnedKeyDown(keyName, preserveHooks, downMode := "Down") {
+    global syntheticDown
+    ; Record ownership first so an ExitApp arriving between these statements can only cause
+    ; a harmless extra key-up, never leave an unowned synthetic key-down behind.
+    syntheticDown[keyName] := true
+    SendKeyEvents("{Blind}{" keyName " " downMode "}", preserveHooks)
+}
+
+SendOwnedKeyUp(keyName, preserveHooks) {
+    global syntheticDown
+    SendKeyEvents("{Blind}{" keyName " Up}", preserveHooks)
+    if syntheticDown.Has(keyName)
+        syntheticDown.Delete(keyName)
+}
+
+ReleaseSyntheticHeld(*) {
+    global syntheticDown
+    SetKeyDelay -1, -1
+    SetMouseDelay -1
+    ; Never cancel a real held input. Its eventual hardware key-up will clear Windows' logical
+    ; state; everything not physically held is state owned solely by this script and must go up.
+    for keyName in syntheticDown {
+        if !GetKeyState(keyName, "P")
+            SendEvent("{Blind}{" keyName " Up}")
+    }
+    syntheticDown.Clear()
+}
+
+MirrorPhysicalMouseDown(keyName, preserveHooks) {
+    global mirroredMouseDown
+    mirroredMouseDown[keyName] := true
+    SendOwnedKeyDown(keyName, preserveHooks)
+    SetTimer CheckMirroredMouseReleases, 10
+}
+
+ReleaseMirroredMouse(keyName, preserveHooks := true) {
+    global mirroredMouseDown
+    SendOwnedKeyUp(keyName, preserveHooks)
+    if mirroredMouseDown.Has(keyName)
+        mirroredMouseDown.Delete(keyName)
+}
+
+CheckMirroredMouseReleases(*) {
+    global mirroredMouseDown
+    released := []
+    for keyName in mirroredMouseDown {
+        if !GetKeyState(keyName, "P")
+            released.Push(keyName)
+    }
+    for keyName in released
+        ReleaseMirroredMouse(keyName)
+    if (mirroredMouseDown.Count = 0)
+        SetTimer CheckMirroredMouseReleases, 0
+}
+
+DoPressKey(keyName, preserveHooks := false) {
     if GetKeyState(keyName)
         return
-    SendInput("{Blind}{" keyName " DownTemp}")
+    SendOwnedKeyDown(keyName, preserveHooks, "DownTemp")
     try {
         Sleep 30
     } finally {
         if !GetKeyState(keyName, "P")
-            SendInput("{Blind}{" keyName " Up}")
+            SendOwnedKeyUp(keyName, preserveHooks)
     }
 }
 
 ; Acquire only modifier state that this action owns. A macro must never release a modifier
 ; which was already held by the user or by the Copilot remap.
-AcquireModifier(modKey) {
+AcquireModifier(modKey, preserveHooks := false) {
     if (modKey = "" || GetKeyState(modKey))
         return false
-    SendInput("{Blind}{" modKey " DownTemp}")
+    SendOwnedKeyDown(modKey, preserveHooks, "DownTemp")
     return true
 }
 
-ReleaseModifier(modKey, owned) {
+ReleaseModifier(modKey, owned, preserveHooks := false) {
     if !owned
         return
     ; If the user physically pressed it while the action ran, their eventual physical key-up
     ; owns the release; sending one here would cancel the real held modifier.
     if !GetKeyState(modKey, "P")
-        SendInput("{Blind}{" modKey " Up}")
+        SendOwnedKeyUp(modKey, preserveHooks)
 }
 
 ; A held remap. The press hotkey calls HoldKeyDown and a paired wildcard key-up
@@ -1320,14 +1468,14 @@ ReleaseModifier(modKey, owned) {
 ; the trigger, so its logical/physical state can't be polled for release.
 HoldKeyDown(keyStr) {
     for k in HoldKeyList(keyStr)
-        SendInput("{Blind}{" k " DownR}")
+        SendOwnedKeyDown(k, true, "DownR")
 }
 
 HoldKeyUp(keyStr) {
     keys := HoldKeyList(keyStr)
     i := keys.Length
     while (i >= 1) {
-        SendInput("{Blind}{" keys[i] " Up}")
+        SendOwnedKeyUp(keys[i], true)
         i--
     }
 }
@@ -1402,15 +1550,17 @@ RepeatHold(keys, interval, triggerKey, exe, holdMs, enabledKey, useWindowsState)
     ; GetAsyncKeyState reads the current OS state instead of that same cached hook state. It is
     ; skipped when the repeated output includes the trigger itself, because that synthetic input
     ; legitimately changes the OS state; the key-up latch and hook state still cover that case.
+    SetTimer CheckRepeatReleases, 10
     while ((repeatDown.Has(triggerKey) && repeatDown[triggerKey]) && RepeatTriggerPhysicallyDown(triggerKey, useWindowsState)) {
-        ; Pause (don't fire) while this profile is toggled off or its app is not focused —
-        ; so the repeat can't leak into other apps — but keep looping until release.
+        ; Toggling the profile off or leaving its target app ends this press. Retaining the
+        ; loop across a focus change lets a missed key-up leave a stale repeat ready to resume.
         if (!enabled[enabledKey] || (exe != "" && !WinActive("ahk_exe " exe))) {
-            Sleep 15
-            continue
+            break
         }
         start := A_TickCount
-        DoPress(keys, holdMs, true)
+        ; Every repeat preserves both physical-input hooks. Besides keeping this trigger's
+        ; release visible, that prevents an unrelated mouse/key release from being displaced.
+        DoPress(keys, holdMs, true, true)
         elapsed := A_TickCount - start
         if (elapsed < interval)
             Sleep interval - elapsed
@@ -1452,7 +1602,7 @@ mod tests {
         assert!(script.contains("#HotIf copilotState = \"waiting\"\n$*LShift::"));
         assert_eq!(script.matches("$*LShift::").count(), 1);
         assert!(!script.contains("$*LShift up::"));
-        assert!(script.contains("AcquireModifier(modKey)"));
+        assert!(script.contains("AcquireModifier(modKey, preserveHooks := false)"));
         assert!(script.contains("if (modKey = \"\" || GetKeyState(modKey))"));
         assert!(script.contains("if !GetKeyState(modKey, \"P\")"));
         assert!(!script.contains("SendModState("));
@@ -1472,7 +1622,40 @@ mod tests {
         assert!(script.contains("DllCall(\"GetAsyncKeyState\", \"Int\", vk, \"Short\") & 0x8000"));
         assert!(script.contains("&& RepeatTriggerPhysicallyDown(triggerKey, useWindowsState)"));
         assert!(script.contains("DllCall(\"GetSystemMetrics\", \"Int\", 23)"));
+        assert!(script.contains("DoPress(keys, holdMs, true, true)"));
+        assert!(script.contains("if preserveHooks\n        SendEvent(keys)"));
+        assert!(script.contains("SetKeyDelay -1, -1"));
+        assert!(script.contains("SetMouseDelay -1"));
+        assert!(script.contains("SetTimer CheckRepeatReleases, 10"));
         assert!(!script.contains("&& GetKeyState(triggerKey, \"P\")"));
+    }
+
+    #[test]
+    fn repeat_ends_when_its_profile_loses_authority() {
+        let script = generate_combined_script(&[]);
+
+        assert!(script.contains(
+            "if (!enabled[enabledKey] || (exe != \"\" && !WinActive(\"ahk_exe \" exe))) {\n            break"
+        ));
+        assert!(!script.contains("so the repeat can't leak into other apps"));
+    }
+
+    #[test]
+    fn generated_script_releases_owned_synthetic_input_on_exit() {
+        let script = generate_combined_script(&[]);
+
+        assert!(script.contains("global syntheticDown := Map()"));
+        assert!(script.contains("OnExit ReleaseSyntheticHeld"));
+        assert!(script.contains(
+            "OnExit ReleaseSyntheticHeld\nOnExit ReleaseCopilotHeld\nOnExit HideOverlayOnExit"
+        ));
+        assert!(script.contains("syntheticDown[keyName] := true"));
+        assert!(script.contains("if !GetKeyState(keyName, \"P\")\n            SendEvent"));
+        assert!(script.contains("SendOwnedKeyDown(k, true, \"DownR\")"));
+        assert!(script.contains("SendOwnedKeyUp(keys[i], true)"));
+        assert!(script.contains("global mirroredMouseDown := Map()"));
+        assert!(script.contains("MirrorPhysicalMouseDown(phys, preserveHooks)"));
+        assert!(script.contains("SetTimer CheckMirroredMouseReleases, 10"));
     }
 
     #[test]
