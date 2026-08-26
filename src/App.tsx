@@ -202,9 +202,16 @@ function toAhkKey(e: KeyboardEvent, activeSideModifiers: Set<string>): string {
     Backspace: "Backspace", Delete: "Del", Insert: "Ins", Home: "Home", End: "End",
     PrintScreen: "PrintScreen", NumLock: "NumLock", CapsLock: "CapsLock",
   };
-  // Unlike e.key, e.code retains the keypad position when Num Lock is off.
-  // Keep keypad digits named so they do not collapse into top-row digits.
-  let key = /^Numpad[0-9]$/.test(e.code) ? e.code : e.key;
+  // Unlike e.key, e.code retains the keypad position. Keep keypad operators named so they
+  // do not collapse into the corresponding main-keyboard character.
+  const keypadKeys: Record<string, string> = {
+    NumpadDivide: "NumpadDiv",
+    NumpadMultiply: "NumpadMult",
+    NumpadSubtract: "NumpadSub",
+    NumpadAdd: "NumpadAdd",
+    NumpadEnter: "NumpadEnter",
+  };
+  let key = keypadKeys[e.code] ?? (/^Numpad[0-9]$/.test(e.code) ? e.code : e.key);
   if (key in keyMap) key = keyMap[key];
   else if (/^F\d+$/.test(key)) key = key.toLowerCase();
   else if (key.length === 1) {
