@@ -17,10 +17,19 @@ const TRAY_QUIT_ID: &str = "tray_quit";
 const GLOBAL_GAME_EXE: &str = "*";
 
 #[cfg(target_os = "windows")]
-struct BorderlessWindowState {
+struct WindowTransformState {
+    hwnd: isize,
     style: i32,
     ex_style: i32,
     placement: winapi::um::winuser::WINDOWPLACEMENT,
+    borderless: bool,
+    stretched: bool,
+}
+
+#[cfg(target_os = "windows")]
+enum WindowTransform {
+    Borderless,
+    Stretch,
 }
 
 #[cfg(target_os = "windows")]
@@ -36,8 +45,8 @@ pub struct AppState {
     pub db_path: std::path::PathBuf,
     pub scripts_path: std::path::PathBuf,
     /// The single always-on AutoHotkey process holding the Copilot remap and every armed
-    /// profile's hotkeys, each gated to its own app via #HotIf. Regenerated + relaunched
-    /// whenever profiles change.
+    /// profile's hotkeys, each gated to its folder's app via #HotIf. Regenerated + relaunched
+    /// whenever folders or profiles change.
     pub hotkeys_ahk: Mutex<ahk::AhkManager>,
     pub overlay_config: Mutex<config::OverlayConfig>,
     /// One Windows Job Object per profile (each kill-on-close) holding that profile's launched
@@ -46,7 +55,7 @@ pub struct AppState {
     #[cfg(target_os = "windows")]
     pub script_jobs: Mutex<HashMap<String, JobObject>>,
     #[cfg(target_os = "windows")]
-    borderless_windows: Mutex<HashMap<String, BorderlessWindowState>>,
+    window_transforms: Mutex<HashMap<String, WindowTransformState>>,
 }
 
 /// A Windows Job Object configured to kill every process in it when the job handle closes. The
@@ -233,6 +242,10 @@ fn debug_overlay_log(message: String) {
 
 #[tauri::command]
 fn upsert_game(state: State<AppState>, game: Game) -> Result<Database, String> {
+    let mut game = game;
+    if game.id == config::GLOBAL_FOLDER_ID {
+        game.exe = GLOBAL_GAME_EXE.to_string();
+    }
     let mut db = config::load_db(&state.db_path)?;
     match db.games.iter_mut().find(|g| g.id == game.id) {
         Some(existing) => *existing = game,
@@ -282,9 +295,8 @@ fn delete_profile(state: State<AppState>, game_id: String, profile_id: String) -
     Ok(db)
 }
 
-/// Arm or disarm a profile (the replacement for the old activate/deactivate). Arming makes its
-/// hotkeys/scripts live automatically whenever its app is focused; multiple profiles can be
-/// armed at once.
+/// Arm or disarm a profile. Arming makes its hotkeys/scripts live automatically whenever its
+/// folder's app is focused; multiple profiles can be armed at once.
 #[tauri::command]
 fn set_profile_armed(app: tauri::AppHandle, state: State<AppState>, profile_id: String, armed: bool) -> Result<Database, String> {
     let mut db = config::load_db(&state.db_path)?;
@@ -518,7 +530,7 @@ fn is_global_game_exe(exe: &str) -> bool {
     exe.trim() == GLOBAL_GAME_EXE
 }
 
-/// Regenerate the combined AHK script from every armed profile across all folders and
+/// Regenerate the combined AHK script from every armed profile and its folder target and
 /// (re)launch the single always-on process. It stays alive even with no armed profiles because
 /// it also owns the Copilot-key remap. Called after any profile/arming change. Note: an edit
 /// the process relaunches — fine because edits happen from the manager UI, not in a game.
@@ -527,7 +539,11 @@ fn sync_hotkeys(state: &AppState, db: &Database) {
     for game in &db.games {
         for profile in &game.profiles {
             if profile.armed {
-                armed.push(ahk::ArmedProfile { siblings: &game.profiles, profile });
+                armed.push(ahk::ArmedProfile {
+                    siblings: &game.profiles,
+                    profile,
+                    exe: &game.exe,
+                });
             }
         }
     }
@@ -605,14 +621,22 @@ fn get_global_viewport() -> WindowClientBounds {
 #[cfg(target_os = "windows")]
 fn overlay_target_exe(db: &Database) -> Option<String> {
     if let Some(fg) = foreground_exe() {
-        let matches = db.games.iter().flat_map(|g| &g.profiles)
-            .any(|p| p.armed && p.kind == "overlay" && !p.overlay_disabled && p.exe.eq_ignore_ascii_case(&fg));
+        let matches = db.games.iter().any(|game| {
+            game.exe.eq_ignore_ascii_case(&fg)
+                && game.profiles.iter().any(|profile| {
+                    profile.armed && profile.kind == "overlay" && !profile.overlay_disabled
+                })
+        });
         if matches {
             return Some(fg);
         }
     }
-    let has_global = db.games.iter().flat_map(|g| &g.profiles)
-        .any(|p| p.armed && p.kind == "overlay" && !p.overlay_disabled && is_global_game_exe(&p.exe));
+    let has_global = db.games.iter().any(|game| {
+        is_global_game_exe(&game.exe)
+            && game.profiles.iter().any(|profile| {
+                profile.armed && profile.kind == "overlay" && !profile.overlay_disabled
+            })
+    });
     if has_global {
         return Some(GLOBAL_GAME_EXE.to_string());
     }
@@ -736,6 +760,30 @@ fn start_overlay_listener(handle: tauri::AppHandle) {
                             run_script_by_id(&handle, &id);
                         }
                         ("200 OK", Vec::new())
+                    } else if route == "/borderless" {
+                        match get_query_param(action, "exe").filter(|value| !value.is_empty()) {
+                            Some(exe) => match toggle_borderless(handle.state(), exe) {
+                                Ok(enabled) => ("200 OK", enabled.to_string().into_bytes()),
+                                Err(err) => ("404 Not Found", err.into_bytes()),
+                            },
+                            None => ("400 Bad Request", b"Missing executable".to_vec()),
+                        }
+                    } else if route == "/stretch" {
+                        match get_query_param(action, "exe").filter(|value| !value.is_empty()) {
+                            Some(exe) => match toggle_stretch(handle.state(), exe) {
+                                Ok(enabled) => ("200 OK", enabled.to_string().into_bytes()),
+                                Err(err) => ("404 Not Found", err.into_bytes()),
+                            },
+                            None => ("400 Bad Request", b"Missing executable".to_vec()),
+                        }
+                    } else if route == "/killprocess" {
+                        match get_query_param(action, "exe").filter(|value| !value.is_empty()) {
+                            Some(exe) => match kill_game(exe) {
+                                Ok(()) => ("200 OK", Vec::new()),
+                                Err(err) => ("404 Not Found", err.into_bytes()),
+                            },
+                            None => ("400 Bad Request", b"Missing executable".to_vec()),
+                        }
                     } else if route == "/focus" {
                         // The AHK script reports which armed profile's app just became focused
                         // (or none). Push that profile's overlay config, or clear it.
@@ -1091,89 +1139,200 @@ fn kill_game(exe: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn make_borderless_fullscreen(state: State<AppState>, exe: String) -> Result<bool, String> {
+fn toggle_borderless(state: State<AppState>, exe: String) -> Result<bool, String> {
     #[cfg(target_os = "windows")]
-    {
-        let key = exe.to_lowercase();
-        let hwnd = find_window_by_exe(&exe)
-            .ok_or_else(|| format!("Game window not found for '{exe}'"))?;
-
-        unsafe {
-            use winapi::um::winuser::*;
-
-            let mut borderless_windows = state.borderless_windows.lock().unwrap();
-            if let Some(saved) = borderless_windows.remove(&key) {
-                let mut placement = saved.placement;
-                placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
-
-                SetWindowLongW(hwnd, GWL_STYLE, saved.style);
-                SetWindowLongW(hwnd, GWL_EXSTYLE, saved.ex_style);
-
-                if SetWindowPlacement(hwnd, &placement) == 0 {
-                    return Err("Failed to restore previous window placement".to_string());
-                }
-
-                if SetWindowPos(
-                    hwnd,
-                    std::ptr::null_mut(),
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOMOVE | SWP_NOSIZE,
-                ) == 0 {
-                    return Err("Failed to restore previous window frame".to_string());
-                }
-
-                return Ok(false);
-            }
-
-            let style = GetWindowLongW(hwnd, GWL_STYLE);
-            let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
-            let mut placement: WINDOWPLACEMENT = std::mem::zeroed();
-            placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
-            if GetWindowPlacement(hwnd, &mut placement) == 0 {
-                return Err("Failed to read current window placement".to_string());
-            }
-
-            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-            let mut mi: MONITORINFO = std::mem::zeroed();
-            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-            if GetMonitorInfoW(monitor, &mut mi) == 0 {
-                return Err("Failed to read monitor bounds".to_string());
-            }
-
-            SetWindowLongW(hwnd, GWL_STYLE, style & !(WS_OVERLAPPEDWINDOW as i32));
-            SetWindowLongW(
-                hwnd,
-                GWL_EXSTYLE,
-                ex_style & !((WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_DLGMODALFRAME | WS_EX_STATICEDGE) as i32),
-            );
-
-            let r = mi.rcMonitor;
-            if SetWindowPos(
-                hwnd, HWND_TOP,
-                r.left, r.top, r.right - r.left, r.bottom - r.top,
-                SWP_FRAMECHANGED | SWP_NOACTIVATE,
-            ) == 0 {
-                SetWindowLongW(hwnd, GWL_STYLE, style);
-                SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style);
-                return Err("Failed to enable borderless fullscreen".to_string());
-            }
-
-            borderless_windows.insert(
-                key,
-                BorderlessWindowState {
-                    style,
-                    ex_style,
-                    placement,
-                },
-            );
-        }
-        Ok(true)
-    }
+    return toggle_window_transform(&state, &exe, WindowTransform::Borderless);
     #[cfg(not(target_os = "windows"))]
     Err("Not supported on this platform".to_string())
+}
+
+#[tauri::command]
+fn toggle_stretch(state: State<AppState>, exe: String) -> Result<bool, String> {
+    #[cfg(target_os = "windows")]
+    return toggle_window_transform(&state, &exe, WindowTransform::Stretch);
+    #[cfg(not(target_os = "windows"))]
+    Err("Not supported on this platform".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn toggle_window_transform(
+    state: &AppState,
+    exe: &str,
+    transform: WindowTransform,
+) -> Result<bool, String> {
+    let key = exe.to_lowercase();
+    let hwnd = find_window_by_exe(exe)
+        .ok_or_else(|| format!("Game window not found for '{exe}'"))?;
+    let hwnd_value = hwnd as isize;
+    let mut transforms = state.window_transforms.lock().unwrap();
+
+    if transforms.get(&key).is_some_and(|saved| saved.hwnd != hwnd_value) {
+        transforms.remove(&key);
+    }
+
+    let newly_captured = !transforms.contains_key(&key);
+    if newly_captured {
+        transforms.insert(key.clone(), capture_window_transform(hwnd)?);
+    }
+
+    let (enabled, remove_state, error) = {
+        let saved = transforms.get_mut(&key).unwrap();
+        let previous = (saved.borderless, saved.stretched);
+        let enabled = match transform {
+            WindowTransform::Borderless => {
+                saved.borderless = !saved.borderless;
+                saved.borderless
+            }
+            WindowTransform::Stretch => {
+                saved.stretched = !saved.stretched;
+                saved.stretched
+            }
+        };
+
+        match unsafe { apply_window_transform(hwnd, saved) } {
+            Ok(()) => (enabled, !saved.borderless && !saved.stretched, None),
+            Err(error) => {
+                saved.borderless = previous.0;
+                saved.stretched = previous.1;
+                let _ = unsafe { apply_window_transform(hwnd, saved) };
+                (enabled, newly_captured, Some(error))
+            }
+        }
+    };
+
+    if remove_state {
+        transforms.remove(&key);
+    }
+    match error {
+        Some(error) => Err(error),
+        None => Ok(enabled),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn capture_window_transform(
+    hwnd: winapi::shared::windef::HWND,
+) -> Result<WindowTransformState, String> {
+    use winapi::um::winuser::{GetWindowLongW, GetWindowPlacement, GWL_EXSTYLE, GWL_STYLE, WINDOWPLACEMENT};
+
+    unsafe {
+        let mut placement: WINDOWPLACEMENT = std::mem::zeroed();
+        placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+        if GetWindowPlacement(hwnd, &mut placement) == 0 {
+            return Err("Failed to read current window placement".to_string());
+        }
+        Ok(WindowTransformState {
+            hwnd: hwnd as isize,
+            style: GetWindowLongW(hwnd, GWL_STYLE),
+            ex_style: GetWindowLongW(hwnd, GWL_EXSTYLE),
+            placement,
+            borderless: false,
+            stretched: false,
+        })
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn apply_window_transform(
+    hwnd: winapi::shared::windef::HWND,
+    saved: &WindowTransformState,
+) -> Result<(), String> {
+    use winapi::um::winuser::*;
+
+    let style = if saved.borderless {
+        saved.style & !(WS_OVERLAPPEDWINDOW as i32)
+    } else {
+        saved.style
+    };
+    let ex_style = if saved.borderless {
+        saved.ex_style
+            & !((WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_DLGMODALFRAME | WS_EX_STATICEDGE) as i32)
+    } else {
+        saved.ex_style
+    };
+    SetWindowLongW(hwnd, GWL_STYLE, style);
+    SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style);
+
+    if saved.stretched {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut monitor_info: MONITORINFO = std::mem::zeroed();
+        monitor_info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut monitor_info) == 0 {
+            return Err("Failed to read monitor bounds".to_string());
+        }
+
+        let bounds = monitor_info.rcMonitor;
+        let mut outer = winapi::shared::windef::RECT {
+            left: 0,
+            top: 0,
+            right: bounds.right - bounds.left,
+            bottom: bounds.bottom - bounds.top,
+        };
+        if AdjustWindowRectEx(
+            &mut outer,
+            style as u32,
+            (!GetMenu(hwnd).is_null()) as i32,
+            ex_style as u32,
+        ) == 0
+        {
+            return Err("Failed to calculate the stretched window frame".to_string());
+        }
+
+        // Keep the window frame, but bypass its normal WM_WINDOWPOSCHANGING size constraints so
+        // fixed-size games cannot replace the requested monitor bounds with their preferred size.
+        if SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            bounds.left + outer.left,
+            bounds.top + outer.top,
+            outer.right - outer.left,
+            outer.bottom - outer.top,
+            SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSENDCHANGING,
+        ) == 0 {
+            return Err("Failed to stretch the window".to_string());
+        }
+
+        let mut actual: winapi::shared::windef::RECT = std::mem::zeroed();
+        if GetClientRect(hwnd, &mut actual) == 0 {
+            return Err("Failed to verify the stretched client bounds".to_string());
+        }
+        let mut client_origin = winapi::shared::windef::POINT { x: 0, y: 0 };
+        if ClientToScreen(hwnd, &mut client_origin) == 0 {
+            return Err("Failed to verify the stretched client position".to_string());
+        }
+        let requested_width = bounds.right - bounds.left;
+        let requested_height = bounds.bottom - bounds.top;
+        let actual_width = actual.right - actual.left;
+        let actual_height = actual.bottom - actual.top;
+        if client_origin.x != bounds.left
+            || client_origin.y != bounds.top
+            || actual_width != requested_width
+            || actual_height != requested_height
+        {
+            return Err(format!(
+                "The target window refused the stretch (requested {requested_width}x{requested_height}, got {actual_width}x{actual_height})",
+            ));
+        }
+        return Ok(());
+    }
+
+    let mut placement = saved.placement;
+    placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+    if SetWindowPlacement(hwnd, &placement) == 0 {
+        return Err("Failed to restore previous window placement".to_string());
+    }
+    if SetWindowPos(
+        hwnd,
+        std::ptr::null_mut(),
+        0,
+        0,
+        0,
+        0,
+        SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOMOVE | SWP_NOSIZE,
+    ) == 0 {
+        return Err("Failed to update the window frame".to_string());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1549,8 +1708,8 @@ fn run_script_by_id(handle: &tauri::AppHandle, id: &str) {
 fn start_watcher(handle: tauri::AppHandle) {
     std::thread::spawn(move || {
         let mut last_tick = std::time::SystemTime::now();
-        // Per-armed-profile "was the app running last tick", so launch-triggered scripts fire
-        // once on the not-running -> running edge. A profile whose app is already running at
+        // Per-armed-profile "was the folder app running last tick", so launch-triggered scripts fire
+        // once on the not-running -> running edge. A profile whose folder app is already running at
         // first observation is seeded, so it doesn't fire retroactively.
         let mut launch_running: HashMap<String, bool> = HashMap::new();
         let mut first_tick = true;
@@ -1580,7 +1739,7 @@ fn start_watcher(handle: tauri::AppHandle) {
                 Err(_) => continue,
             };
 
-            // Launch-triggered scripts: fire when an armed profile's app transitions to running.
+            // Launch-triggered scripts: fire when an armed profile's folder app transitions to running.
             for game in &db.games {
                 for profile in &game.profiles {
                     let has_launch = profile.armed
@@ -1589,7 +1748,7 @@ fn start_watcher(handle: tauri::AppHandle) {
                         launch_running.remove(&profile.id);
                         continue;
                     }
-                    let now_running = is_process_running(&profile.exe);
+                    let now_running = is_process_running(&game.exe);
                     let was_running = launch_running.insert(profile.id.clone(), now_running);
                     if was_running == Some(false) && now_running {
                         for script in profile.scripts.iter().filter(|s| s.enabled && s.trigger == "launch") {
@@ -1702,7 +1861,7 @@ pub fn run() {
                 #[cfg(target_os = "windows")]
                 script_jobs: Mutex::new(HashMap::new()),
                 #[cfg(target_os = "windows")]
-                borderless_windows: Mutex::new(HashMap::new()),
+                window_transforms: Mutex::new(HashMap::new()),
             });
 
             // Launch the combined Copilot remap and profile hotkeys script at startup.
@@ -1812,7 +1971,8 @@ pub fn run() {
             pick_coordinate,
             kill_game,
             list_open_executables,
-            make_borderless_fullscreen,
+            toggle_borderless,
+            toggle_stretch,
             write_text_file,
             read_text_file,
             read_image_as_data_url,
