@@ -3,8 +3,8 @@ use std::collections::HashSet;
 use std::path::Path;
 
 /// The db.json schema version. Bumped when the shape changes so `load_db` can migrate
-/// older files. v2 = scope-becomes-folder + profile-owns-exe/scripts/arming.
-pub const CURRENT_DB_VERSION: u32 = 2;
+/// older files. v3 = folder-owned executable + profile-owned behaviors/scripts/arming.
+pub const CURRENT_DB_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Database {
@@ -15,12 +15,13 @@ pub struct Database {
     pub settings: Settings,
 }
 
-/// A Scope is now just a named folder that groups profiles. Everything else (the target
-/// executable, hotkeys, scripts, overlay, toggle keys) lives on the Profile.
+/// A folder owns one target executable shared by all of its profiles.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Game {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub exe: String,
     #[serde(default)]
     pub image: Option<String>,
     #[serde(default)]
@@ -28,7 +29,7 @@ pub struct Game {
 }
 
 /// A user script owned by a profile. It runs either when its hotkey is pressed (while the
-/// profile's app is focused) or when the profile's app is launched. The body is either inline
+/// folder's app is focused) or when the folder's app is launched. The body is either inline
 /// code typed by the user or a path to a script file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Script {
@@ -67,10 +68,8 @@ fn default_profile_kind() -> String {
     "hotkeys".to_string()
 }
 
-/// A Profile targets one executable and owns everything that runs against it: hotkeys,
-/// scripts, overlay, states. When `armed`, its hotkeys/scripts are live automatically while
-/// its `exe` is the focused window. `exe == "*"` means "any app / always". Profiles with an
-/// empty `exe` are simply inert (never focused-matched).
+/// A profile owns behaviors, scripts, overlay items, and states that run against its folder's
+/// target executable. Arming controls whether those behaviors are active.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     pub id: String,
@@ -78,8 +77,6 @@ pub struct Profile {
     /// "hotkeys" | "scripts" | "overlay" — what the profile is for (drives the editor UI).
     #[serde(default = "default_profile_kind")]
     pub kind: String,
-    #[serde(default)]
-    pub exe: String,
     #[serde(default)]
     pub armed: bool,
     #[serde(default)]
@@ -302,18 +299,25 @@ pub fn ensure_global_folder(db: &mut Database) -> bool {
         db.games.push(Game {
             id: GLOBAL_FOLDER_ID.to_string(),
             name: "Global".to_string(),
+            exe: "*".to_string(),
             image: None,
             profiles: Vec::new(),
         });
         return true;
     }
     if indices.len() == 1 {
+        let global = &mut db.games[indices[0]];
+        if global.exe != "*" {
+            global.exe = "*".to_string();
+            return true;
+        }
         return false;
     }
     // Merge every duplicate Global folder's profiles into the first, then drop the extras.
     let keep = indices[0];
     let merged: Vec<Profile> = indices.iter().flat_map(|&i| db.games[i].profiles.clone()).collect();
     db.games[keep].profiles = merged;
+    db.games[keep].exe = "*".to_string();
     for &i in indices.iter().skip(1).rev() {
         db.games.remove(i);
     }
@@ -331,16 +335,24 @@ pub fn load_db(path: &Path) -> Result<Database, String> {
     let value: serde_json::Value = serde_json::from_str(&content).map_err(|e| e.to_string())?;
     let version = value.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
-    let (mut db, migrated) = if version >= CURRENT_DB_VERSION {
-        (serde_json::from_value(value).map_err(|e| e.to_string())?, false)
-    } else {
-        // Old shape (scope-owned exe/scripts/active_profile) → migrate to profile-owned. Back up
-        // the pre-migration file once.
-        let legacy: legacy_v1::Database = serde_json::from_value(value).map_err(|e| e.to_string())?;
-        let mut backup = path.as_os_str().to_owned();
-        backup.push(".v1.bak");
-        let _ = std::fs::copy(path, std::path::Path::new(&backup));
-        (legacy_v1::migrate(legacy), true)
+    let (mut db, migrated) = match version {
+        v if v >= CURRENT_DB_VERSION => {
+            (serde_json::from_value(value).map_err(|e| e.to_string())?, false)
+        }
+        2 => {
+            let legacy: legacy_v2::Database = serde_json::from_value(value).map_err(|e| e.to_string())?;
+            let mut backup = path.as_os_str().to_owned();
+            backup.push(".v2.bak");
+            let _ = std::fs::copy(path, std::path::Path::new(&backup));
+            (legacy_v2::migrate(legacy), true)
+        }
+        _ => {
+            let legacy: legacy_v1::Database = serde_json::from_value(value).map_err(|e| e.to_string())?;
+            let mut backup = path.as_os_str().to_owned();
+            backup.push(".v1.bak");
+            let _ = std::fs::copy(path, std::path::Path::new(&backup));
+            (legacy_v1::migrate(legacy), true)
+        }
     };
 
     // Self-heal the always-present global folder, then persist only when something changed.
@@ -351,8 +363,182 @@ pub fn load_db(path: &Path) -> Result<Database, String> {
     Ok(db)
 }
 
+/// Reads v2's profile-owned executable shape and groups profiles under folder-owned targets.
+/// A folder containing several targets is split so every profile keeps its activation behavior.
+mod legacy_v2 {
+    use super::{Database as NewDatabase, Game as NewGame, Profile, Settings, CURRENT_DB_VERSION, GLOBAL_FOLDER_ID};
+    use serde::Deserialize;
+    use std::collections::HashSet;
+
+    #[derive(Deserialize)]
+    pub struct Database {
+        #[serde(rename = "scopes", alias = "games", default)]
+        pub games: Vec<Game>,
+        #[serde(default)]
+        pub settings: Settings,
+    }
+
+    #[derive(Deserialize)]
+    pub struct Game {
+        pub id: String,
+        #[serde(default)]
+        pub name: String,
+        #[serde(default)]
+        pub image: Option<String>,
+        #[serde(default)]
+        pub profiles: Vec<LegacyProfile>,
+    }
+
+    #[derive(Deserialize)]
+    pub struct LegacyProfile {
+        #[serde(default)]
+        pub exe: String,
+        #[serde(flatten)]
+        pub profile: Profile,
+    }
+
+    fn normalized_exe(exe: &str) -> String {
+        exe.trim().to_string()
+    }
+
+    fn target_label(exe: &str) -> &str {
+        match exe {
+            "*" => "Any app",
+            "" => "No app",
+            value => value,
+        }
+    }
+
+    fn split_id(
+        original_id: &str,
+        ordinal: usize,
+        reserved: &HashSet<String>,
+        allocated: &mut HashSet<String>,
+    ) -> String {
+        let mut suffix = ordinal;
+        loop {
+            let candidate = format!("{original_id}-target-{suffix}");
+            if !reserved.contains(&candidate) && allocated.insert(candidate.clone()) {
+                return candidate;
+            }
+            suffix += 1;
+        }
+    }
+
+    fn materialize_cross_target_inheritance(profiles: &mut [LegacyProfile]) {
+        let snapshots: Vec<Profile> = profiles.iter().map(|entry| entry.profile.clone()).collect();
+        for index in 0..profiles.len() {
+            let Some(parent_id) = snapshots[index].parent_id.as_deref() else { continue };
+            let Some(parent_index) = snapshots.iter().position(|profile| profile.id == parent_id) else { continue };
+            if normalized_exe(&profiles[index].exe)
+                .eq_ignore_ascii_case(&normalized_exe(&profiles[parent_index].exe))
+            {
+                continue;
+            }
+
+            let profile = &snapshots[index];
+            profiles[index].profile.hotkeys = super::resolve_profile_hotkeys(&snapshots, profile)
+                .into_iter()
+                .cloned()
+                .collect();
+            profiles[index].profile.states = super::resolve_profile_states(&snapshots, profile)
+                .into_iter()
+                .cloned()
+                .collect();
+            profiles[index].profile.overlay_items = super::resolve_profile_overlay_items(&snapshots, profile)
+                .into_iter()
+                .cloned()
+                .collect();
+            profiles[index].profile.parent_id = None;
+        }
+    }
+
+    pub fn migrate(legacy: Database) -> NewDatabase {
+        let reserved: HashSet<String> = legacy.games.iter().map(|game| game.id.clone()).collect();
+        let mut allocated = HashSet::new();
+        let mut games = Vec::new();
+
+        for mut game in legacy.games {
+            materialize_cross_target_inheritance(&mut game.profiles);
+            let mut groups: Vec<(String, Vec<Profile>)> = Vec::new();
+            for entry in game.profiles {
+                let exe = normalized_exe(&entry.exe);
+                if let Some((_, profiles)) = groups
+                    .iter_mut()
+                    .find(|(target, _)| target.eq_ignore_ascii_case(&exe))
+                {
+                    profiles.push(entry.profile);
+                } else {
+                    groups.push((exe, vec![entry.profile]));
+                }
+            }
+
+            if game.id == GLOBAL_FOLDER_ID {
+                allocated.insert(game.id.clone());
+                let global_index = groups.iter().position(|(exe, _)| exe == "*");
+                let global_profiles = global_index
+                    .map(|index| groups.remove(index).1)
+                    .unwrap_or_default();
+                games.push(NewGame {
+                    id: game.id.clone(),
+                    name: game.name.clone(),
+                    exe: "*".to_string(),
+                    image: game.image.clone(),
+                    profiles: global_profiles,
+                });
+                for (index, (exe, profiles)) in groups.into_iter().enumerate() {
+                    games.push(NewGame {
+                        id: split_id(&game.id, index + 2, &reserved, &mut allocated),
+                        name: format!("{} ({})", game.name, target_label(&exe)),
+                        exe,
+                        image: game.image.clone(),
+                        profiles,
+                    });
+                }
+                continue;
+            }
+
+            if groups.is_empty() {
+                allocated.insert(game.id.clone());
+                games.push(NewGame {
+                    id: game.id,
+                    name: game.name,
+                    exe: String::new(),
+                    image: game.image,
+                    profiles: Vec::new(),
+                });
+                continue;
+            }
+
+            let multiple_targets = groups.len() > 1;
+            for (index, (exe, profiles)) in groups.into_iter().enumerate() {
+                let id = if index == 0 {
+                    allocated.insert(game.id.clone());
+                    game.id.clone()
+                } else {
+                    split_id(&game.id, index + 1, &reserved, &mut allocated)
+                };
+                let name = if multiple_targets {
+                    format!("{} ({})", game.name, target_label(&exe))
+                } else {
+                    game.name.clone()
+                };
+                games.push(NewGame {
+                    id,
+                    name,
+                    exe,
+                    image: game.image.clone(),
+                    profiles,
+                });
+            }
+        }
+
+        NewDatabase { version: CURRENT_DB_VERSION, games, settings: legacy.settings }
+    }
+}
+
 /// Reads the pre-v2 db.json shape (exe/scripts/toggle-keys/overlay_disabled on the Scope, plus
-/// `active_profile`) and rewrites it so each Profile owns those fields. See CURRENT_DB_VERSION.
+/// `active_profile`) and writes it directly into the current folder-owned executable shape.
 mod legacy_v1 {
     use super::{Database as NewDatabase, Profile, Script, Settings, CURRENT_DB_VERSION};
     use serde::Deserialize;
@@ -406,7 +592,6 @@ mod legacy_v1 {
                     .profiles
                     .into_iter()
                     .map(|mut p| {
-                        p.exe = g.exe.clone();
                         p.overlay_disabled = g.overlay_disabled;
                         p.toggle_hotkeys_key = g.toggle_hotkeys_key.clone();
                         p.toggle_overlay_key = g.toggle_overlay_key.clone();
@@ -425,7 +610,7 @@ mod legacy_v1 {
                         p
                     })
                     .collect();
-                super::Game { id: g.id, name: g.name, image: g.image, profiles }
+                super::Game { id: g.id, name: g.name, exe: g.exe, image: g.image, profiles }
             })
             .collect();
         NewDatabase { version: CURRENT_DB_VERSION, games, settings: legacy.settings }
@@ -522,4 +707,42 @@ pub fn resolve_profile_overlay_items<'a>(profiles: &'a [Profile], profile: &'a P
         overlay_item_id,
         &mut visited,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{legacy_v2, Hotkey};
+
+    #[test]
+    fn v2_migration_splits_multi_target_folders_and_preserves_inheritance() {
+        let legacy: legacy_v2::Database = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "scopes": [{
+                "id": "games",
+                "name": "Games",
+                "profiles": [{
+                    "id": "base",
+                    "name": "Base",
+                    "exe": "First.exe",
+                    "hotkeys": [{ "trigger": "f1", "behavior": "press(1)" }]
+                }, {
+                    "id": "child",
+                    "name": "Child",
+                    "exe": "Second.exe",
+                    "parent_id": "base"
+                }]
+            }]
+        })).unwrap();
+
+        let migrated = legacy_v2::migrate(legacy);
+
+        assert_eq!(migrated.version, 3);
+        assert_eq!(migrated.games.len(), 2);
+        assert_eq!(migrated.games[0].exe, "First.exe");
+        assert_eq!(migrated.games[1].exe, "Second.exe");
+        let child = &migrated.games[1].profiles[0];
+        assert_eq!(child.parent_id, None);
+        assert!(matches!(child.hotkeys.as_slice(), [Hotkey { trigger, behavior, .. }]
+            if trigger == "f1" && behavior == "press(1)"));
+    }
 }

@@ -41,21 +41,21 @@ function uid() {
   return crypto.randomUUID();
 }
 
-/** A Scope is just a folder now — name + image + its profiles. */
+/** A folder owns one app target shared by all of its profiles. */
 function blankGame(): Scope {
-  return { id: uid(), name: "", image: null, profiles: [] };
+  return { id: uid(), name: "", exe: "", image: null, profiles: [] };
 }
 
-/** A profile targets one app (`exe`) and owns its hotkeys/scripts/overlay/states. */
+/** A profile owns the behaviors that run against its folder's app target. */
 function blankProfile(): Profile {
   return {
-    id: uid(), name: "", kind: "hotkeys", exe: "", armed: false, parent_id: null,
+    id: uid(), name: "", kind: "hotkeys", armed: false, parent_id: null,
     hotkeys: [], states: [], overlay_items: [], overlay_triggers: [], overlay_groups: [],
     scripts: [], overlay_disabled: false, toggle_hotkeys_key: null, toggle_overlay_key: null,
   };
 }
 
-/** `exe === "*"` means the profile applies to any app / always. */
+/** `exe === "*"` means the folder applies to any app / always. */
 function isGlobalExe(exe: string) {
   return exe.trim() === GLOBAL_EXE;
 }
@@ -69,13 +69,18 @@ function blankScript(): Script { return { id: uid(), name: "", enabled: true, tr
 
 // ── Export / Import helpers ───────────────────────────────────────────────────
 
-function remapProfileIds(profile: Profile): Profile {
+type LegacyProfileExport = Profile & { exe?: string };
+type LegacyScopeExport = Omit<Scope, "exe" | "profiles"> & { exe?: string; profiles: LegacyProfileExport[] };
+
+function remapProfileIds(profile: LegacyProfileExport, profileIds?: Map<string, string>): Profile {
+  const { exe: _legacyExe, ...profileData } = profile;
   const stateMap = new Map(profile.states.map(s => [s.id, uid()]));
   const groupMap = new Map((profile.overlay_groups ?? []).map(g => [g.id, uid()]));
   return {
-    ...profile,
-    id: uid(),
+    ...profileData,
+    id: profileIds?.get(profile.id) ?? uid(),
     armed: false,
+    parent_id: profile.parent_id ? (profileIds?.get(profile.parent_id) ?? profile.parent_id) : null,
     scripts: (profile.scripts ?? []).map(s => ({ ...s, id: uid() })),
     states: profile.states.map(s => ({ ...s, id: stateMap.get(s.id)! })),
     overlay_groups: (profile.overlay_groups ?? []).map(g => ({ ...g, id: groupMap.get(g.id)! })),
@@ -102,7 +107,7 @@ async function exportProfile(profile: Profile) {
     filters: [{ name: "HKM Profile", extensions: ["hkm-profile"] }],
   });
   if (!path) return;
-  await api.writeTextFile(path, JSON.stringify({ version: 1, type: "profile", data: profile }, null, 2));
+  await api.writeTextFile(path, JSON.stringify({ version: 2, type: "profile", data: profile }, null, 2));
 }
 
 async function exportScope(scope: Scope) {
@@ -112,7 +117,7 @@ async function exportScope(scope: Scope) {
     filters: [{ name: "HKM Scope", extensions: ["hkm-scope"] }],
   });
   if (!path) return;
-  await api.writeTextFile(path, JSON.stringify({ version: 1, type: "scope", data: scope }, null, 2));
+  await api.writeTextFile(path, JSON.stringify({ version: 2, type: "scope", data: scope }, null, 2));
 }
 
 async function importProfile(): Promise<Profile | null> {
@@ -127,7 +132,7 @@ async function importProfile(): Promise<Profile | null> {
   return remapProfileIds(raw.data as Profile);
 }
 
-async function importScope(): Promise<Scope | null> {
+async function importScope(): Promise<Scope[] | null> {
   const path = await openDialog({
     title: "Import Scope",
     filters: [{ name: "HKM Scope", extensions: ["hkm-scope", "json"] }],
@@ -136,12 +141,51 @@ async function importScope(): Promise<Scope | null> {
   if (!path) return null;
   const raw = JSON.parse(await api.readTextFile(path as string));
   if (raw.type !== "scope") throw new Error("File is not a scope export");
-  const scope = raw.data as Scope;
-  return {
+  const scope = raw.data as LegacyScopeExport;
+  const profileIds = new Map(scope.profiles.map(profile => [profile.id, uid()]));
+  let entries = scope.profiles.map(profile => ({
+    target: typeof scope.exe === "string" ? scope.exe.trim() : (profile.exe ?? "").trim(),
+    profile: remapProfileIds(profile, profileIds),
+  }));
+
+  const allProfiles = entries.map(entry => entry.profile);
+  const targetsByProfile = new Map(entries.map(entry => [entry.profile.id, entry.target]));
+  entries = entries.map(entry => {
+    const parent = entry.profile.parent_id
+      ? allProfiles.find(profile => profile.id === entry.profile.parent_id)
+      : undefined;
+    if (!parent || (targetsByProfile.get(parent.id) ?? "").toLowerCase() === entry.target.toLowerCase()) {
+      return entry;
+    }
+    return {
+      ...entry,
+      profile: {
+        ...entry.profile,
+        parent_id: null,
+        hotkeys: resolveHotkeys(allProfiles, entry.profile).map(({ hotkey }) => ({ ...hotkey })),
+        states: resolveStates(allProfiles, entry.profile).map(({ state }) => ({ ...state })),
+        overlay_items: resolveOverlayItems(allProfiles, entry.profile).map(({ item }) => ({ ...item })),
+      },
+    };
+  });
+
+  const groups: Array<{ exe: string; profiles: Profile[] }> = [];
+  for (const entry of entries) {
+    const group = groups.find(candidate => candidate.exe.toLowerCase() === entry.target.toLowerCase());
+    if (group) group.profiles.push(entry.profile);
+    else groups.push({ exe: entry.target, profiles: [entry.profile] });
+  }
+  if (groups.length === 0) groups.push({ exe: typeof scope.exe === "string" ? scope.exe.trim() : "", profiles: [] });
+
+  return groups.map(group => ({
     ...scope,
     id: uid(),
-    profiles: scope.profiles.map(remapProfileIds),
-  };
+    name: groups.length === 1
+      ? scope.name
+      : `${scope.name} (${isGlobalExe(group.exe) ? "Any app" : group.exe || "No app"})`,
+    exe: group.exe,
+    profiles: group.profiles,
+  }));
 }
 
 function formatDuration(ms: number | null) {
@@ -378,7 +422,7 @@ type Selection =
   | { kind: "settings" }
   | { kind: "empty" };
 
-/** Whether an armed profile's app is currently present (so its hotkeys can fire). "*" is always present. */
+/** Whether an armed profile's folder app is present (so its hotkeys can fire). "*" is always present. */
 function profileAppActive(exe: string, openExes: Set<string>): boolean {
   return isGlobalExe(exe) || openExes.has(exe.trim().toLowerCase());
 }
@@ -523,15 +567,15 @@ function useLibraryWidth() {
   return { w, onPointerDown };
 }
 
-function ProfileRow({ profile, openExes, selected, onSelect, onToggleArmed, onContext }: {
-  profile: Profile; openExes: Set<string>; selected: boolean;
+function ProfileRow({ profile, folderExe, openExes, selected, onSelect, onToggleArmed, onContext }: {
+  profile: Profile; folderExe: string; openExes: Set<string>; selected: boolean;
   onSelect: () => void; onToggleArmed: (a: boolean) => void; onContext: (e: ReactMouseEvent) => void;
 }) {
   return (
     <button
       className={`profile-row ${selected ? "profile-row--active" : ""} ${profile.armed ? "profile-row--armed" : ""}`}
       onClick={onSelect} onContextMenu={onContext} title={profile.name}>
-      <StatusDot armed={profile.armed} active={profileAppActive(profile.exe, openExes)} />
+      <StatusDot armed={profile.armed} active={profileAppActive(folderExe, openExes)} />
       <span className="profile-row__name">{profile.name || "Untitled"}</span>
       <span className="target-chip">{profile.kind.charAt(0).toUpperCase() + profile.kind.slice(1)}</span>
       <ArmSwitch armed={profile.armed} onChange={onToggleArmed} />
@@ -565,7 +609,7 @@ function FolderGroup({ folder, openExes, open, selectedProfileId, visibleProfile
       {open && (
         <div className="folder-group__profiles">
           {visibleProfiles.map(p => (
-            <ProfileRow key={p.id} profile={p} openExes={openExes} selected={p.id === selectedProfileId}
+            <ProfileRow key={p.id} profile={p} folderExe={folder.exe} openExes={openExes} selected={p.id === selectedProfileId}
               onSelect={() => onSelectProfile(p.id)} onToggleArmed={a => onToggleArmed(p.id, a)}
               onContext={e => onProfileContext(e, folder.id, p)} />
           ))}
@@ -594,13 +638,13 @@ function Library({ db, openExes, selection, query, collapsed, width, onQuery, on
 }) {
   const q = query.trim().toLowerCase();
   const filtering = q !== "";
-  const match = (p: Profile, folderName: string) =>
-    q === "" || p.name.toLowerCase().includes(q) || p.exe.toLowerCase().includes(q) || folderName.toLowerCase().includes(q);
+  const match = (p: Profile, folder: Scope) =>
+    q === "" || p.name.toLowerCase().includes(q) || folder.exe.toLowerCase().includes(q) || folder.name.toLowerCase().includes(q);
   const selectedProfileId = selection.kind === "profile" ? selection.profileId : undefined;
 
   const groups = [...db.scopes]
     .sort((a, b) => a.name.localeCompare(b.name))
-    .map(f => ({ f, visible: f.profiles.filter(p => match(p, f.name)) }))
+    .map(f => ({ f, visible: f.profiles.filter(p => match(p, f)) }))
     .filter(g => !filtering || g.visible.length > 0);
 
   return (
@@ -622,7 +666,13 @@ function Library({ db, openExes, selection, query, collapsed, width, onQuery, on
       <div className="library__footer">
         <button className="btn btn--ghost btn--full" onClick={() => onModal({ type: "addGame" })}>New folder</button>
         <button className="btn btn--ghost btn--full" onClick={async () => {
-          try { const scope = await importScope(); if (!scope) return; onDb(await api.upsertGame(scope)); } catch (e) { alert(String(e)); }
+          try {
+            const scopes = await importScope();
+            if (!scopes) return;
+            let updated: Database | null = null;
+            for (const scope of scopes) updated = await api.upsertGame(scope);
+            if (updated) onDb(updated);
+          } catch (e) { alert(String(e)); }
         }}>Import folder</button>
         <button className={`btn btn--ghost btn--full ${selection.kind === "settings" ? "btn--primary" : ""}`}
           onClick={() => onSelect({ kind: "settings" })}>Settings</button>
@@ -631,7 +681,7 @@ function Library({ db, openExes, selection, query, collapsed, width, onQuery, on
   );
 }
 
-/** Edit a folder (Scope) — just a name and an optional image. */
+/** Edit a folder's shared app target, name, and optional image. */
 function FolderModal({ initial, onSave, onClose }: {
   initial: Scope;
   onSave: (g: Scope) => void;
@@ -639,6 +689,13 @@ function FolderModal({ initial, onSave, onClose }: {
 }) {
   const [name, setName] = useState(initial.name);
   const [image, setImage] = useState<string | null>(initial.image);
+  const globalFolder = initial.id === GLOBAL_FOLDER_ID;
+  const startedGlobal = globalFolder || isGlobalExe(initial.exe);
+  const [anyApp, setAnyApp] = useState(startedGlobal);
+  const [exe, setExe] = useState(startedGlobal ? "" : initial.exe);
+  const [openExes, setOpenExes] = useState<string[]>([]);
+
+  useEffect(() => { api.listOpenExecutables().then(setOpenExes).catch(() => {}); }, []);
 
   async function browseImage() {
     const selected = await openDialog({
@@ -670,40 +727,51 @@ function FolderModal({ initial, onSave, onClose }: {
             ✕ Remove image
           </button>
         )}
-        <input className="modal-name" value={name} onChange={e => setName(e.target.value)} placeholder="Group name" autoFocus />
+        <input className="modal-name" value={name} onChange={e => setName(e.target.value)} placeholder="Folder name" autoFocus />
+        <label className="checkbox-row">
+          <input type="checkbox" checked={anyApp} disabled={globalFolder}
+            onChange={e => setAnyApp(e.target.checked)} />
+          <span>Any app</span>
+        </label>
+        {!anyApp && (
+          <div className="input-row">
+            <input value={exe} onChange={e => setExe(e.target.value)} placeholder="game.exe" />
+            <select value="" onChange={e => { if (e.target.value) setExe(e.target.value); }} title="Pick an open app">
+              <option value="">Open apps…</option>
+              {openExes.map(exeName => <option key={exeName} value={exeName}>{exeName}</option>)}
+            </select>
+          </div>
+        )}
         <div className="modal__actions">
           <button className="btn btn--ghost" onClick={onClose}>Cancel</button>
-          <button className="btn btn--primary" onClick={() => onSave({ ...initial, name, image })}>Save</button>
+          <button className="btn btn--primary" onClick={() => onSave({
+            ...initial,
+            name,
+            exe: globalFolder || anyApp ? GLOBAL_EXE : exe.trim(),
+            image,
+          })}>Save</button>
         </div>
       </div>
     </div>
   );
 }
 
-/** Edit a profile's app target and options: name, executable (or "any app"), overlay on/off,
- *  and the optional toggle keys. Hotkeys/scripts/overlay items are edited in the profile tabs. */
+/** Edit profile-owned options. The application target is owned by the containing folder. */
 function ProfileSettingsModal({ initial, onSave, onClose }: {
   initial: Profile;
   onSave: (p: Profile) => void;
   onClose: () => void;
 }) {
-  const startedGlobal = isGlobalExe(initial.exe);
   const kind = initial.kind;
   const [name, setName] = useState(initial.name);
-  const [anyApp, setAnyApp] = useState(startedGlobal);
-  const [exe, setExe] = useState(startedGlobal ? "" : initial.exe);
-  const [openExes, setOpenExes] = useState<string[]>([]);
   const [overlayOn, setOverlayOn] = useState(!initial.overlay_disabled);
   const [toggleHotkeysKey, setToggleHotkeysKey] = useState(initial.toggle_hotkeys_key ?? "");
   const [toggleOverlayKey, setToggleOverlayKey] = useState(initial.toggle_overlay_key ?? "");
-
-  useEffect(() => { api.listOpenExecutables().then(setOpenExes).catch(() => {}); }, []);
 
   function build(): Profile {
     return {
       ...initial,
       name: name.trim(),
-      exe: anyApp ? GLOBAL_EXE : exe.trim(),
       overlay_disabled: !overlayOn,
       toggle_hotkeys_key: toggleHotkeysKey || null,
       toggle_overlay_key: toggleOverlayKey || null,
@@ -717,19 +785,6 @@ function ProfileSettingsModal({ initial, onSave, onClose }: {
       <div className="modal" onClick={e => e.stopPropagation()}>
         <h2>{initial.name ? `${kindLabel} Profile` : `New ${kindLabel} Profile`}</h2>
         <input className="modal-name" value={name} onChange={e => setName(e.target.value)} placeholder="Profile name" autoFocus />
-        <label className="checkbox-row">
-          <input type="checkbox" checked={anyApp} onChange={e => setAnyApp(e.target.checked)} />
-          <span>Any app</span>
-        </label>
-        {!anyApp && (
-          <div className="input-row">
-            <input value={exe} onChange={e => setExe(e.target.value)} placeholder="game.exe" />
-            <select value="" onChange={e => { if (e.target.value) setExe(e.target.value); }} title="Pick an open app">
-              <option value="">Open apps…</option>
-              {openExes.map(exeName => <option key={exeName} value={exeName}>{exeName}</option>)}
-            </select>
-          </div>
-        )}
         {kind === "overlay" && (
           <label className="checkbox-row">
             <input type="checkbox" checked={overlayOn} onChange={e => setOverlayOn(e.target.checked)} />
@@ -760,7 +815,7 @@ type Step =
   | { type: "state"; stateId: string }
   | { type: "sleep"; ms: string }
   | { type: "send"; text: string }
-  | { type: "lock" | "savecursor" | "restorecursor" };
+  | { type: "borderless" | "killprocess" | "lock" | "savecursor" | "restorecursor" | "stretch" };
 
 function parseSteps(behavior: string): Step[] {
   if (!behavior.trim()) return [];
@@ -773,6 +828,9 @@ function parseSteps(behavior: string): Step[] {
     if ((m = s.match(/^state\((.+)\)$/))) return [{ type: "state" as const, stateId: m[1] }];
     if ((m = s.match(/^sleep\((\d+)\)$/))) return [{ type: "sleep" as const, ms: m[1] }];
     if ((m = s.match(/^send\((.+)\)$/))) return [{ type: "send" as const, text: m[1] }];
+    if (s === "borderless") return [{ type: "borderless" as const }];
+    if (s === "killprocess") return [{ type: "killprocess" as const }];
+    if (s === "stretch") return [{ type: "stretch" as const }];
     if (s === "lock") return [{ type: "lock" as const }];
     if (s === "savecursor") return [{ type: "savecursor" as const }];
     if (s === "restorecursor") return [{ type: "restorecursor" as const }];
@@ -942,8 +1000,10 @@ function HotkeyModal({ initial, gameExe, states, onSave, onClose }: {
             {steps.length === 0 && <div className="steps-empty">No steps yet</div>}
           </div>
           <div className="step-add-btns">
+            <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "borderless" })}>+ borderless</button>
             <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "goto", x: "", y: "" })}>+ goto</button>
             <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "hold", key: "" })}>+ hold</button>
+            <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "killprocess" })}>+ killprocess</button>
             <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "lock" })}>+ lock</button>
             <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "press", key: "" })}>+ press</button>
             <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "repeat", key: "", interval: "100", hold: "6" })}>+ repeat</button>
@@ -952,6 +1012,7 @@ function HotkeyModal({ initial, gameExe, states, onSave, onClose }: {
             <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "send", text: "" })}>+ send</button>
             <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "sleep", ms: "" })}>+ sleep</button>
             <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "state", stateId: states[0]?.id ?? "" })}>+ state</button>
+            <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "stretch" })}>+ stretch</button>
           </div>
         </div>
 
@@ -1535,7 +1596,7 @@ function ProfileEditor({ folder, profile, showStates, onExitStates, onContext, o
   onModal: (m: Modal) => void;
 }) {
   const profileId = profile.id;
-  const profileExe = profile.exe;
+  const profileExe = folder.exe;
 
   async function setArmed(armed: boolean) {
     try { onDb(await api.setProfileArmed(profile.id, armed)); } catch (e) { alert(String(e)); }
@@ -1986,15 +2047,12 @@ export default function App() {
   }
 
   function profileMenu(folderId: string, p: Profile): CtxItem[] {
-    const global = isGlobalExe(p.exe);
     return [
       { label: "Settings", onClick: () => setModal({ type: "profileSettings", gameId: folderId, profile: p, isNew: false }) },
       { label: p.parent_id ? "Change parent" : "Inherit from…", onClick: () => setModal({ type: "setParent", gameId: folderId, profile: p }) },
       { label: "Copy to…", onClick: () => setModal({ type: "copyProfile", sourceGameId: folderId, profile: p }) },
       ...(p.kind !== "scripts" ? [{ label: "Edit states…", onClick: () => { setSelection({ kind: "profile", folderId, profileId: p.id }); setStatesFor(p.id); } }] : []),
       { label: "Export profile", onClick: () => exportProfile(p).catch(e => alert(String(e))) },
-      ...(!global ? [{ label: "Make borderless", onClick: async () => { try { await api.makeBorderlessFullscreen(p.exe); } catch (e) { alert(String(e)); } } }] : []),
-      ...(!global ? [{ label: "Kill process", onClick: async () => { if (!confirm(`Force-kill "${p.exe}"?`)) return; try { await api.killGame(p.exe); } catch (e) { alert(String(e)); } } }] : []),
       { label: "Delete profile", danger: true, onClick: async () => { if (!confirm(`Delete profile "${p.name}"?`)) return; try { handleDb(await api.deleteProfile(folderId, p.id)); } catch (e) { alert(String(e)); } } },
     ];
   }
@@ -2012,6 +2070,8 @@ export default function App() {
       catch (e) { alert(String(e)); }
     };
     const isGlobalFolder = folder.id === GLOBAL_FOLDER_ID;
+    const targetExe = folder.exe.trim();
+    const hasProcessTarget = targetExe !== "" && !isGlobalExe(targetExe);
     return [
       { label: "New hotkeys profile", onClick: () => newProfile("hotkeys") },
       { label: "New scripts profile", onClick: () => newProfile("scripts") },
@@ -2022,8 +2082,20 @@ export default function App() {
       } },
       { label: "Arm all", onClick: () => armAll(true) },
       { label: "Disarm all", onClick: () => armAll(false) },
-      { label: "Rename folder…", onClick: () => setModal({ type: "editGame", game: folder }) },
+      { label: "Folder settings…", onClick: () => setModal({ type: "editGame", game: folder }) },
       { label: "Export folder", onClick: () => exportScope(folder).catch(e => alert(String(e))) },
+      ...(hasProcessTarget ? [
+        { label: "Toggle borderless", onClick: async () => {
+          try { await api.toggleBorderless(targetExe); } catch (e) { alert(String(e)); }
+        } },
+        { label: "Toggle stretch", onClick: async () => {
+          try { await api.toggleStretch(targetExe); } catch (e) { alert(String(e)); }
+        } },
+        { label: "Kill process", onClick: async () => {
+          if (!confirm(`Force-kill "${targetExe}"?`)) return;
+          try { await api.killGame(targetExe); } catch (e) { alert(String(e)); }
+        } },
+      ] : []),
       ...(!isGlobalFolder ? [{ label: "Delete folder", danger: true, onClick: async () => {
         if (!confirm(`Delete folder "${folder.name}" and all its profiles?`)) return;
         try { handleDb(await api.deleteGame(folder.id)); } catch (e) { alert(String(e)); }
@@ -2170,7 +2242,13 @@ export default function App() {
   const selProfile = selection.kind === "profile" ? selFolder?.profiles.find(p => p.id === selection.profileId) ?? null : null;
 
   async function importFolder() {
-    try { const scope = await importScope(); if (!scope) return; handleDb(await api.upsertGame(scope)); }
+    try {
+      const scopes = await importScope();
+      if (!scopes) return;
+      let updated: Database | null = null;
+      for (const scope of scopes) updated = await api.upsertGame(scope);
+      if (updated) handleDb(updated);
+    }
     catch (e) { alert(String(e)); }
   }
 
@@ -2209,7 +2287,7 @@ export default function App() {
             <div className="detail__empty">
               {db.scopes.length === 0
                 ? <EmptyState title="No folders yet"
-                    hint="Folders group the profiles you set up per app. Each profile targets one app and holds its hotkeys, scripts, overlay, and states."
+                    hint="Each folder targets one app shared by its profiles, which hold the hotkeys, scripts, overlay, and states."
                     action={{ label: "New folder", onClick: () => setModal({ type: "addGame" }) }}
                     secondary={{ label: "Import folder", onClick: importFolder }} />
                 : <EmptyState title="Select a profile"

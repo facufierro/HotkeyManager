@@ -67,7 +67,6 @@ export interface Profile {
   id: string;
   name: string;
   kind: ProfileKind;
-  exe: string;
   armed: boolean;
   parent_id: string | null;
   hotkeys: Hotkey[];
@@ -97,10 +96,11 @@ export interface Script {
   path: string;
 }
 
-/** A Scope is just a named folder that groups profiles. */
+/** A folder owns the application target shared by its profiles. */
 export interface Scope {
   id: string;
   name: string;
+  exe: string;
   image: string | null;
   profiles: Profile[];
 }

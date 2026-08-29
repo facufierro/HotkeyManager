@@ -25,8 +25,11 @@ export const api = {
   listOpenExecutables: () =>
     invoke<string[]>("list_open_executables"),
 
-  makeBorderlessFullscreen: (exe: string) =>
-    invoke<boolean>("make_borderless_fullscreen", { exe }),
+  toggleBorderless: (exe: string) =>
+    invoke<boolean>("toggle_borderless", { exe }),
+
+  toggleStretch: (exe: string) =>
+    invoke<boolean>("toggle_stretch", { exe }),
 
   upsertGame: (game: Scope) =>
     invoke<Database>("upsert_game", { game }),

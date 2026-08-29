@@ -293,6 +293,7 @@ fn resolve_ahk_exe(configured: &str, bundled: Option<&Path>) -> String {
 pub struct ArmedProfile<'a> {
     pub siblings: &'a [Profile],
     pub profile: &'a Profile,
+    pub exe: &'a str,
 }
 
 /// Emit one armed profile's `#HotIf` block(s). Hotkeys/scripts sit under
@@ -308,7 +309,7 @@ fn generate_profile_block(
     repeat_up_lines: &mut String,
 ) -> String {
     let p = ap.profile;
-    let exe = p.exe.trim();
+    let exe = ap.exe.trim();
     let global_game = exe == GLOBAL_GAME_EXE;
     let id = escape_ahk_string(&p.id);
     let exe_esc = escape_ahk_string(exe);
@@ -372,11 +373,12 @@ fn generate_profile_block(
         }
 
         let behavior = escape_ahk_string(&hk.behavior);
+        let behavior_exe = escape_ahk_string(exe);
         // Run the behavior first, then notify the overlay (when a state_id makes the ping
         // meaningful): the ping is a blocking localhost request, so doing it after keeps a
         // busy backend from delaying the output.
         lines.push_str(&format!(
-            "{ahk_key}:: {{\n    ExecuteBehavior(\"{behavior}\", \"{trigger_modifiers}\")\n{notify}}}\n"
+            "{ahk_key}:: {{\n    ExecuteBehavior(\"{behavior}\", \"{trigger_modifiers}\", \"{behavior_exe}\")\n{notify}}}\n"
         ));
     }
 
@@ -423,7 +425,7 @@ pub fn generate_combined_script(armed: &[ArmedProfile]) -> String {
     // Specific-exe blocks first, "*" last, so an app's binding takes precedence over a global
     // one for the same key.
     let mut ordered: Vec<&ArmedProfile> = armed.iter().collect();
-    ordered.sort_by_key(|ap| ap.profile.exe.trim() == GLOBAL_GAME_EXE);
+    ordered.sort_by_key(|ap| ap.exe.trim() == GLOBAL_GAME_EXE);
 
     let mut used_keys: HashMap<String, HashSet<String>> = HashMap::new();
     let mut repeat_ups: HashSet<String> = HashSet::new();
@@ -434,7 +436,7 @@ pub fn generate_combined_script(armed: &[ArmedProfile]) -> String {
 
     for ap in &ordered {
         let p = ap.profile;
-        let exe = p.exe.trim();
+        let exe = ap.exe.trim();
         if exe.is_empty() { continue; }
         let id = escape_ahk_string(&p.id);
         enabled_init.push_str(&format!("enabled[\"{id}\"] := true\n"));
@@ -1084,7 +1086,20 @@ BlindFor(triggerModifiers, outputModifiers := "") {
     return "{Blind" triggerModifiers "}"
 }
 
-ExecuteBehavior(str, triggerModifiers := "") {
+SendBehaviorCommand(command, configuredExe) {
+    targetExe := configuredExe
+    if (targetExe = "*") {
+        try {
+            targetExe := WinGetProcessName("A")
+        } catch Error {
+            return
+        }
+    }
+    if (targetExe != "")
+        SendOverlayCommand(command "?exe=" UriEncode(targetExe))
+}
+
+ExecuteBehavior(str, triggerModifiers := "", configuredExe := "") {
     MouseGetPos &savedX, &savedY
     locked := false
     try {
@@ -1105,6 +1120,12 @@ ExecuteBehavior(str, triggerModifiers := "") {
             } else if (token = "lock") {
                 BlockInput "MouseMove"
                 locked := true
+            } else if (token = "borderless") {
+                SendBehaviorCommand("borderless", configuredExe)
+            } else if (token = "killprocess") {
+                SendBehaviorCommand("killprocess", configuredExe)
+            } else if (token = "stretch") {
+                SendBehaviorCommand("stretch", configuredExe)
             } else if RegExMatch(token, "i)^goto\((-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\)$", &m) {
                 SendMode "Event"
                 SetMouseDelay -1
@@ -1654,7 +1675,6 @@ mod tests {
             id: "test-profile".to_string(),
             name: "Test".to_string(),
             kind: "hotkeys".to_string(),
-            exe: "*".to_string(),
             armed: true,
             parent_id: None,
             hotkeys: vec![Hotkey {
@@ -1686,19 +1706,39 @@ mod tests {
         let armed = [ArmedProfile {
             siblings: std::slice::from_ref(&profile),
             profile: &profile,
+            exe: "*",
         }];
         let script = generate_combined_script(&armed);
 
         assert!(script.contains(
-            "$*>!left:: {\n    ExecuteBehavior(\"press(Home)\", \"^!\")"
+            "$*>!left:: {\n    ExecuteBehavior(\"press(Home)\", \"^!\", \"*\")"
         ));
         assert!(script.contains(
-            "$*>!right:: {\n    ExecuteBehavior(\"press(End)\", \"^!\")"
+            "$*>!right:: {\n    ExecuteBehavior(\"press(End)\", \"^!\", \"*\")"
         ));
         assert!(script.contains("return \"{Blind\" triggerModifiers \"}\""));
         assert!(!script.contains("ReleaseTriggerModifiers"));
         assert_eq!(trigger_modifier_symbols("ralt left"), "^!");
         assert_eq!(trigger_modifier_symbols("lctrl rshift lalt left"), "^+!");
+    }
+
+    #[test]
+    fn behavior_commands_receive_the_profile_target() {
+        let profile = profile_with_hotkey("f11", "borderless;stretch;killprocess");
+        let armed = [ArmedProfile {
+            siblings: std::slice::from_ref(&profile),
+            profile: &profile,
+            exe: "Game.exe",
+        }];
+        let script = generate_combined_script(&armed);
+
+        assert!(script.contains(
+            "ExecuteBehavior(\"borderless;stretch;killprocess\", \"\", \"Game.exe\")"
+        ));
+        assert!(script.contains("SendBehaviorCommand(\"borderless\", configuredExe)"));
+        assert!(script.contains("SendBehaviorCommand(\"killprocess\", configuredExe)"));
+        assert!(script.contains("SendBehaviorCommand(\"stretch\", configuredExe)"));
+        assert!(script.contains("targetExe := WinGetProcessName(\"A\")"));
     }
 
     #[test]
