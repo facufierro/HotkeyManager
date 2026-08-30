@@ -5,6 +5,13 @@ export interface Hotkey {
   state_id: string | null;
 }
 
+export type BehaviorEventKind = "app_started" | "app_stopped" | "window_ready" | "focus_gained" | "focus_lost";
+
+export interface BehaviorEvent {
+  event: BehaviorEventKind;
+  behavior: string;
+}
+
 export interface ProfileState {
   id: string;
   name: string;
@@ -61,7 +68,7 @@ export interface OverlayGroup {
   name: string;
 }
 
-export type ProfileKind = "hotkeys" | "scripts" | "overlay";
+export type ProfileKind = "hotkeys" | "events" | "scripts" | "overlay";
 
 export interface Profile {
   id: string;
@@ -70,6 +77,7 @@ export interface Profile {
   armed: boolean;
   parent_id: string | null;
   hotkeys: Hotkey[];
+  events: BehaviorEvent[];
   states: ProfileState[];
   overlay_items: OverlayItem[];
   overlay_triggers: OverlayTrigger[];
