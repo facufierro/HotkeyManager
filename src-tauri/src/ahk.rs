@@ -433,21 +433,66 @@ pub fn generate_combined_script(armed: &[ArmedProfile]) -> String {
     let mut blocks = String::new();
     let mut enabled_init = String::new();
     let mut overlay_init = String::new();
+    let mut event_profiles_init = String::new();
+    let mut target_states_init = String::new();
+    let mut event_targets = HashSet::new();
 
     for ap in &ordered {
         let p = ap.profile;
         let exe = ap.exe.trim();
         if exe.is_empty() { continue; }
         let id = escape_ahk_string(&p.id);
+        let exe_esc = escape_ahk_string(exe);
         enabled_init.push_str(&format!("enabled[\"{id}\"] := true\n"));
         blocks.push_str(&generate_profile_block(ap, &mut used_keys, &mut repeat_ups, &mut repeat_up_lines));
-        // Only overlay-type profiles drive the overlay window; a hotkeys/scripts profile never
-        // shows it (otherwise an armed hotkeys profile would pop an empty overlay).
+        // Only overlay-type profiles drive the overlay window; other profile kinds never
+        // show it (otherwise an armed hotkeys profile would pop an empty overlay).
         if p.kind == "overlay" && !p.overlay_disabled {
-            let exe_esc = if exe == GLOBAL_GAME_EXE { "*".to_string() } else { escape_ahk_string(exe) };
+            let overlay_exe = if exe == GLOBAL_GAME_EXE { "*" } else { &exe_esc };
             overlay_init.push_str(&format!(
-                "overlayProfiles.Push(Map(\"id\", \"{id}\", \"exe\", \"{exe_esc}\"))\n"
+                "overlayProfiles.Push(Map(\"id\", \"{id}\", \"exe\", \"{overlay_exe}\"))\n"
             ));
+        }
+
+        if exe != GLOBAL_GAME_EXE {
+            let resolved_events = if p.kind == "events" {
+                config::resolve_profile_events(ap.siblings, p)
+            } else {
+                Vec::new()
+            };
+            let event_pairs: Vec<String> = resolved_events
+                .into_iter()
+                .filter(|event| matches!(
+                    event.event.as_str(),
+                    "app_started" | "app_stopped" | "window_ready" | "focus_gained" | "focus_lost"
+                ))
+                .filter(|event| !event.behavior.trim().is_empty())
+                .map(|event| format!(
+                    "\"{}\", \"{}\"",
+                    escape_ahk_string(&event.event),
+                    escape_ahk_string(&event.behavior),
+                ))
+                .collect();
+            let launch_scripts: Vec<String> = p.scripts
+                .iter()
+                .filter(|script| script.enabled && script.trigger == "launch")
+                .map(|script| format!("\"{}\"", escape_ahk_string(&script.id)))
+                .collect();
+
+            if !event_pairs.is_empty() || !launch_scripts.is_empty() {
+                let event_exe = exe.to_lowercase();
+                let event_exe_esc = escape_ahk_string(&event_exe);
+                let events = format!("Map({})", event_pairs.join(", "));
+                let scripts = format!("[{}]", launch_scripts.join(", "));
+                event_profiles_init.push_str(&format!(
+                    "eventProfiles.Push(Map(\"id\", \"{id}\", \"exe\", \"{event_exe_esc}\", \"target\", \"{exe_esc}\", \"events\", {events}, \"launchScripts\", {scripts}))\n"
+                ));
+                if event_targets.insert(event_exe) {
+                    target_states_init.push_str(&format!(
+                        "targetStates[\"{event_exe_esc}\"] := Map(\"initialized\", false, \"running\", false, \"windowReady\", false, \"focused\", false)\n"
+                    ));
+                }
+            }
         }
     }
 
@@ -468,6 +513,10 @@ global enabled := Map()
 global overlayVisible := false
 global overlayProfiles := []
 global lastFocusId := ""
+global eventProfiles := []
+global targetStates := Map()
+global behaviorEventQueue := []
+global behaviorEventDraining := false
 global repeatDown := Map()
 global syntheticDown := Map()
 global mirroredMouseDown := Map()
@@ -479,7 +528,7 @@ global copilotCtrlReleasePending := false
 global behaviorClipboardBackup := ""
 global behaviorClipboardPending := false
 global behaviorClipboardSequence := 0
-{enabled_init}{overlay_init}OnExit ReleaseSyntheticHeld
+{enabled_init}{overlay_init}{event_profiles_init}{target_states_init}OnExit ReleaseSyntheticHeld
 OnExit ReleaseCopilotHeld
 OnExit HideOverlayOnExit
 OnExit RestoreBehaviorClipboard
@@ -521,11 +570,74 @@ RunScript(id) {{
     SendOverlayCommand("script?id=" UriEncode(id))
 }}
 
-; The overlay follows the focused app: find the first armed overlay profile whose app is
-; focused (specific apps first, then "*"), tell the backend which profile's config to push,
-; and show/hide from that profile's enabled flag.
-SyncOverlay(*) {{
-    global enabled, overlayProfiles, overlayVisible, lastFocusId
+QueueBehaviorEvent(behavior, targetExe) {{
+    global behaviorEventQueue
+    behaviorEventQueue.Push(Map("behavior", behavior, "target", targetExe))
+    SetTimer DrainBehaviorEvents, -1
+}}
+
+DrainBehaviorEvents(*) {{
+    global behaviorEventQueue, behaviorEventDraining
+    if behaviorEventDraining
+        return
+    behaviorEventDraining := true
+    try {{
+        while behaviorEventQueue.Length > 0 {{
+            queued := behaviorEventQueue.RemoveAt(1)
+            ExecuteBehavior(queued["behavior"], "", queued["target"])
+        }}
+    }} finally {{
+        behaviorEventDraining := false
+        if behaviorEventQueue.Length > 0
+            SetTimer DrainBehaviorEvents, -1
+    }}
+}}
+
+DispatchTargetEvent(exe, eventName) {{
+    global eventProfiles
+    for profile in eventProfiles {{
+        if (profile["exe"] != exe)
+            continue
+        if (eventName = "app_started") {{
+            for scriptId in profile["launchScripts"]
+                RunScript(scriptId)
+        }}
+        events := profile["events"]
+        if events.Has(eventName)
+            QueueBehaviorEvent(events[eventName], profile["target"])
+    }}
+}}
+
+; One monitor owns target lifecycle transitions and overlay focus. The first observation only
+; seeds state, so rebuilding this script cannot impersonate an app or focus event.
+SyncRuntime(*) {{
+    global enabled, targetStates, overlayProfiles, overlayVisible, lastFocusId
+    for exe, state in targetStates {{
+        running := ProcessExist(exe) != 0
+        windowReady := running && WinExist("ahk_exe " exe) != 0
+        focused := windowReady && WinActive("ahk_exe " exe) != 0
+        if !state["initialized"] {{
+            state["initialized"] := true
+        }} else {{
+            if !state["running"] && running
+                DispatchTargetEvent(exe, "app_started")
+            if !state["windowReady"] && windowReady
+                DispatchTargetEvent(exe, "window_ready")
+            if !state["focused"] && focused
+                DispatchTargetEvent(exe, "focus_gained")
+            if state["focused"] && !focused
+                DispatchTargetEvent(exe, "focus_lost")
+            if state["running"] && !running
+                DispatchTargetEvent(exe, "app_stopped")
+        }}
+        state["running"] := running
+        state["windowReady"] := windowReady
+        state["focused"] := focused
+    }}
+
+    ; The overlay follows the focused app: find the first armed overlay profile whose app is
+    ; focused (specific apps first, then "*"), tell the backend which profile's config to push,
+    ; and show/hide from that profile's enabled flag.
     focusId := ""
     shouldShow := false
     for p in overlayProfiles {{
@@ -559,8 +671,8 @@ HideOverlayOnExit(*) {{
     SendOverlayCommand("hide")
 }}
 
-SetTimer SyncOverlay, 200
-SyncOverlay()
+SetTimer SyncRuntime, 200
+SyncRuntime()
 
 ; Windows silently removes low-level hooks when the system sleeps or the hook
 ; times out while the process is throttled in the background (idle in the tray),
@@ -1668,7 +1780,7 @@ mod tests {
         generate_combined_script, repeat_output_uses_trigger, trigger_modifier_symbols,
         ArmedProfile,
     };
-    use crate::config::{Hotkey, Profile};
+    use crate::config::{BehaviorEvent, Hotkey, Profile, Script};
 
     fn profile_with_hotkey(trigger: &str, behavior: &str) -> Profile {
         Profile {
@@ -1683,6 +1795,7 @@ mod tests {
                 behavior: behavior.to_string(),
                 state_id: None,
             }],
+            events: Vec::new(),
             states: Vec::new(),
             overlay_items: Vec::new(),
             overlay_triggers: Vec::new(),
@@ -1739,6 +1852,51 @@ mod tests {
         assert!(script.contains("SendBehaviorCommand(\"killprocess\", configuredExe)"));
         assert!(script.contains("SendBehaviorCommand(\"stretch\", configuredExe)"));
         assert!(script.contains("targetExe := WinGetProcessName(\"A\")"));
+    }
+
+    #[test]
+    fn lifecycle_events_and_launch_scripts_share_the_seeded_target_monitor() {
+        let mut profile = profile_with_hotkey("f11", "press(F11)");
+        profile.kind = "events".to_string();
+        profile.hotkeys.clear();
+        profile.events = vec![
+            BehaviorEvent {
+                event: "window_ready".to_string(),
+                behavior: "borderless".to_string(),
+            },
+            BehaviorEvent {
+                event: "focus_gained".to_string(),
+                behavior: "press(F5)".to_string(),
+            },
+        ];
+        profile.scripts.push(Script {
+            id: "launch-script".to_string(),
+            name: "Launch".to_string(),
+            enabled: true,
+            trigger: "launch".to_string(),
+            hotkey: String::new(),
+            language: "python".to_string(),
+            source: "code".to_string(),
+            code: String::new(),
+            path: String::new(),
+        });
+        let armed = [ArmedProfile {
+            siblings: std::slice::from_ref(&profile),
+            profile: &profile,
+            exe: "Game.exe",
+        }];
+        let script = generate_combined_script(&armed);
+
+        assert!(script.contains(
+            "eventProfiles.Push(Map(\"id\", \"test-profile\", \"exe\", \"game.exe\", \"target\", \"Game.exe\""
+        ));
+        assert!(script.contains("\"window_ready\", \"borderless\""));
+        assert!(script.contains("\"focus_gained\", \"press(F5)\""));
+        assert!(script.contains("\"launchScripts\", [\"launch-script\"]"));
+        assert!(script.contains("if !state[\"initialized\"] {\n            state[\"initialized\"] := true"));
+        assert!(script.contains("DispatchTargetEvent(exe, \"app_started\")"));
+        assert!(script.contains("QueueBehaviorEvent(events[eventName], profile[\"target\"])"));
+        assert!(script.contains("SetTimer SyncRuntime, 200\nSyncRuntime()"));
     }
 
     #[test]
