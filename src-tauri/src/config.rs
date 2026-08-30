@@ -3,8 +3,8 @@ use std::collections::HashSet;
 use std::path::Path;
 
 /// The db.json schema version. Bumped when the shape changes so `load_db` can migrate
-/// older files. v3 = folder-owned executable + profile-owned behaviors/scripts/arming.
-pub const CURRENT_DB_VERSION: u32 = 3;
+/// older files. v4 = event-triggered behaviors.
+pub const CURRENT_DB_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Database {
@@ -83,6 +83,8 @@ pub struct Profile {
     pub parent_id: Option<String>,
     #[serde(default)]
     pub hotkeys: Vec<Hotkey>,
+    #[serde(default)]
+    pub events: Vec<BehaviorEvent>,
     #[serde(default)]
     pub states: Vec<ProfileState>,
     #[serde(default)]
@@ -266,6 +268,12 @@ pub struct Hotkey {
     pub state_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BehaviorEvent {
+    pub event: String,
+    pub behavior: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
     pub ahk_exe: String,
@@ -338,6 +346,14 @@ pub fn load_db(path: &Path) -> Result<Database, String> {
     let (mut db, migrated) = match version {
         v if v >= CURRENT_DB_VERSION => {
             (serde_json::from_value(value).map_err(|e| e.to_string())?, false)
+        }
+        3 => {
+            let mut db: Database = serde_json::from_value(value).map_err(|e| e.to_string())?;
+            let mut backup = path.as_os_str().to_owned();
+            backup.push(".v3.bak");
+            let _ = std::fs::copy(path, std::path::Path::new(&backup));
+            db.version = CURRENT_DB_VERSION;
+            (db, true)
         }
         2 => {
             let legacy: legacy_v2::Database = serde_json::from_value(value).map_err(|e| e.to_string())?;
@@ -687,6 +703,17 @@ pub fn resolve_profile_hotkeys<'a>(profiles: &'a [Profile], profile: &'a Profile
     )
 }
 
+pub fn resolve_profile_events<'a>(profiles: &'a [Profile], profile: &'a Profile) -> Vec<&'a BehaviorEvent> {
+    let mut visited = HashSet::new();
+    resolve_profile_entries(
+        profiles,
+        profile,
+        |current| current.events.as_slice(),
+        |event| event.event.clone(),
+        &mut visited,
+    )
+}
+
 pub fn resolve_profile_states<'a>(profiles: &'a [Profile], profile: &'a Profile) -> Vec<&'a ProfileState> {
     let mut visited = HashSet::new();
     resolve_profile_entries(
@@ -711,7 +738,34 @@ pub fn resolve_profile_overlay_items<'a>(profiles: &'a [Profile], profile: &'a P
 
 #[cfg(test)]
 mod tests {
-    use super::{legacy_v2, Hotkey};
+    use super::{legacy_v2, load_db, resolve_profile_events, Hotkey, Profile};
+
+    #[test]
+    fn v3_database_adds_empty_events_and_advances_the_schema() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("macrotoolbox-v3-{unique}.json"));
+        std::fs::write(&path, serde_json::json!({
+            "version": 3,
+            "scopes": [{
+                "id": "games",
+                "name": "Games",
+                "exe": "Game.exe",
+                "profiles": [{ "id": "profile", "name": "Profile" }]
+            }],
+            "settings": { "ahk_exe": "" }
+        }).to_string()).unwrap();
+
+        let migrated = load_db(&path).unwrap();
+
+        assert_eq!(migrated.version, 4);
+        assert!(migrated.games[0].profiles[0].events.is_empty());
+        assert!(path.with_extension("json.v3.bak").exists());
+        let _ = std::fs::remove_file(path.with_extension("json.v3.bak"));
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn v2_migration_splits_multi_target_folders_and_preserves_inheritance() {
@@ -736,7 +790,7 @@ mod tests {
 
         let migrated = legacy_v2::migrate(legacy);
 
-        assert_eq!(migrated.version, 3);
+        assert_eq!(migrated.version, 4);
         assert_eq!(migrated.games.len(), 2);
         assert_eq!(migrated.games[0].exe, "First.exe");
         assert_eq!(migrated.games[1].exe, "Second.exe");
@@ -744,5 +798,32 @@ mod tests {
         assert_eq!(child.parent_id, None);
         assert!(matches!(child.hotkeys.as_slice(), [Hotkey { trigger, behavior, .. }]
             if trigger == "f1" && behavior == "press(1)"));
+    }
+
+    #[test]
+    fn event_inheritance_overrides_by_event_kind() {
+        let profiles: Vec<Profile> = serde_json::from_value(serde_json::json!([{
+            "id": "base",
+            "name": "Base",
+            "kind": "events",
+            "events": [
+                { "event": "app_started", "behavior": "borderless" },
+                { "event": "focus_gained", "behavior": "press(F5)" }
+            ]
+        }, {
+            "id": "child",
+            "name": "Child",
+            "kind": "events",
+            "parent_id": "base",
+            "events": [{ "event": "focus_gained", "behavior": "press(F6)" }]
+        }])).unwrap();
+
+        let resolved = resolve_profile_events(&profiles, &profiles[1]);
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].event, "app_started");
+        assert_eq!(resolved[0].behavior, "borderless");
+        assert_eq!(resolved[1].event, "focus_gained");
+        assert_eq!(resolved[1].behavior, "press(F6)");
     }
 }

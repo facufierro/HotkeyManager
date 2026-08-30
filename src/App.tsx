@@ -10,6 +10,8 @@ import type {
   Scope,
   Profile,
   Hotkey,
+  BehaviorEvent,
+  BehaviorEventKind,
   OverlayItem,
   OverlayGroup,
   ProfileState,
@@ -23,6 +25,7 @@ type Modal =
   | { type: "editGame"; game: Scope }
   | { type: "profileSettings"; gameId: string; profile: Profile; isNew: boolean }
   | { type: "editHotkey"; gameId: string; profileId: string; index: number | null; hotkey: Hotkey; gameExe: string; states: ProfileState[] }
+  | { type: "editEvent"; gameId: string; profileId: string; index: number | null; event: BehaviorEvent; eventKinds: BehaviorEventKind[]; gameExe: string; states: ProfileState[] }
   | { type: "copyHotkey"; sourceGameId: string; sourceProfileId: string; hotkey: Hotkey }
   | { type: "setParent"; gameId: string; profile: Profile }
   | { type: "copyProfile"; sourceGameId: string; profile: Profile }
@@ -50,7 +53,7 @@ function blankGame(): Scope {
 function blankProfile(): Profile {
   return {
     id: uid(), name: "", kind: "hotkeys", armed: false, parent_id: null,
-    hotkeys: [], states: [], overlay_items: [], overlay_triggers: [], overlay_groups: [],
+    hotkeys: [], events: [], states: [], overlay_items: [], overlay_triggers: [], overlay_groups: [],
     scripts: [], overlay_disabled: false, toggle_hotkeys_key: null, toggle_overlay_key: null,
   };
 }
@@ -58,6 +61,10 @@ function blankProfile(): Profile {
 /** `exe === "*"` means the folder applies to any app / always. */
 function isGlobalExe(exe: string) {
   return exe.trim() === GLOBAL_EXE;
+}
+
+function hasSpecificAppTarget(exe: string) {
+  return exe.trim() !== "" && !isGlobalExe(exe);
 }
 
 function blankTimer():   OverlayItem { return { type: "timer", id: uid(), name: "", x: 0, y: 0, duration_ms: 60000, color: "#ffffff", font_size: 22, state_id: null, timer_state_id: null }; }
@@ -81,6 +88,7 @@ function remapProfileIds(profile: LegacyProfileExport, profileIds?: Map<string, 
     id: profileIds?.get(profile.id) ?? uid(),
     armed: false,
     parent_id: profile.parent_id ? (profileIds?.get(profile.parent_id) ?? profile.parent_id) : null,
+    events: profile.events ?? [],
     scripts: (profile.scripts ?? []).map(s => ({ ...s, id: uid() })),
     states: profile.states.map(s => ({ ...s, id: stateMap.get(s.id)! })),
     overlay_groups: (profile.overlay_groups ?? []).map(g => ({ ...g, id: groupMap.get(g.id)! })),
@@ -163,6 +171,7 @@ async function importScope(): Promise<Scope[] | null> {
         ...entry.profile,
         parent_id: null,
         hotkeys: resolveHotkeys(allProfiles, entry.profile).map(({ hotkey }) => ({ ...hotkey })),
+        events: resolveEvents(allProfiles, entry.profile).map(({ event }) => ({ ...event })),
         states: resolveStates(allProfiles, entry.profile).map(({ state }) => ({ ...state })),
         overlay_items: resolveOverlayItems(allProfiles, entry.profile).map(({ item }) => ({ ...item })),
       },
@@ -395,6 +404,11 @@ function resolveHotkeys(profiles: Profile[], profile: Profile): Array<{ hotkey: 
     .map(({ value, own }) => ({ hotkey: value, own }));
 }
 
+function resolveEvents(profiles: Profile[], profile: Profile): Array<{ event: BehaviorEvent; own: boolean }> {
+  return resolveProfileEntries(profiles, profile, current => current.events ?? [], event => event.event)
+    .map(({ value, own }) => ({ event: value, own }));
+}
+
 function resolveStates(profiles: Profile[], profile: Profile): Array<{ state: ProfileState; own: boolean }> {
   return resolveProfileEntries(profiles, profile, current => current.states, state => state.id)
     .map(({ value, own }) => ({ state: value, own }));
@@ -594,6 +608,7 @@ function FolderGroup({ folder, openExes, open, selectedProfileId, visibleProfile
   const newProfile = (kind: ProfileKind) => onModal({ type: "profileSettings", gameId: folder.id, profile: { ...blankProfile(), kind }, isNew: true });
   const typeItems = [
     { label: "Hotkeys profile", onClick: () => newProfile("hotkeys") },
+    ...(hasSpecificAppTarget(folder.exe) ? [{ label: "Events profile", onClick: () => newProfile("events") }] : []),
     { label: "Scripts profile", onClick: () => newProfile("scripts") },
     { label: "Overlay profile", onClick: () => newProfile("overlay") },
   ];
@@ -617,6 +632,7 @@ function FolderGroup({ folder, openExes, open, selectedProfileId, visibleProfile
             <div className="folder-group__empty">
               <span>New profile:</span>
               <button className="link-btn" onClick={() => newProfile("hotkeys")}>Hotkeys</button>
+              {hasSpecificAppTarget(folder.exe) && <button className="link-btn" onClick={() => newProfile("events")}>Events</button>}
               <button className="link-btn" onClick={() => newProfile("scripts")}>Scripts</button>
               <button className="link-btn" onClick={() => newProfile("overlay")}>Overlay</button>
             </div>
@@ -853,6 +869,18 @@ function stepsToString(steps: Step[]): string {
   }).join(";");
 }
 
+const BEHAVIOR_EVENTS: Array<{ value: BehaviorEventKind; label: string }> = [
+  { value: "app_started", label: "App started" },
+  { value: "window_ready", label: "Window ready" },
+  { value: "focus_gained", label: "Focus gained" },
+  { value: "focus_lost", label: "Focus lost" },
+  { value: "app_stopped", label: "App stopped" },
+];
+
+function behaviorEventLabel(event: BehaviorEventKind): string {
+  return BEHAVIOR_EVENTS.find(candidate => candidate.value === event)?.label ?? event;
+}
+
 // ── Step sub-components ───────────────────────────────────────────────────────
 
 function GotoInput({ x, y, gameExe, onChange }: { x: string; y: string; gameExe: string; onChange: (x: string, y: string) => void }) {
@@ -936,6 +964,53 @@ function StepRow({ step, index, total, gameExe, states, onChange, onDelete, onMo
   );
 }
 
+function BehaviorStepsEditor({ steps, gameExe, states, onChange }: {
+  steps: Step[];
+  gameExe: string;
+  states: ProfileState[];
+  onChange: (steps: Step[]) => void;
+}) {
+  function addStep(step: Step) { onChange([...steps, step]); }
+  function removeStep(i: number) { onChange(steps.filter((_, index) => index !== i)); }
+  function updateStep(i: number, step: Step) { onChange(steps.map((current, index) => index === i ? step : current)); }
+  function moveStep(i: number, direction: -1 | 1) {
+    const next = [...steps];
+    const target = i + direction;
+    if (target < 0 || target >= next.length) return;
+    [next[i], next[target]] = [next[target], next[i]];
+    onChange(next);
+  }
+
+  return (
+    <div className="steps-section">
+      <div className="steps-list">
+        {steps.map((step, i) => (
+          <StepRow key={i} step={step} index={i} total={steps.length} gameExe={gameExe} states={states}
+            onChange={next => updateStep(i, next)}
+            onDelete={() => removeStep(i)}
+            onMove={direction => moveStep(i, direction)} />
+        ))}
+        {steps.length === 0 && <div className="steps-empty">No steps yet</div>}
+      </div>
+      <div className="step-add-btns">
+        <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "borderless" })}>+ borderless</button>
+        <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "goto", x: "", y: "" })}>+ goto</button>
+        <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "hold", key: "" })}>+ hold</button>
+        <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "killprocess" })}>+ killprocess</button>
+        <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "lock" })}>+ lock</button>
+        <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "press", key: "" })}>+ press</button>
+        <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "repeat", key: "", interval: "100", hold: "6" })}>+ repeat</button>
+        <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "restorecursor" })}>+ restorecursor</button>
+        <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "savecursor" })}>+ savecursor</button>
+        <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "send", text: "" })}>+ send</button>
+        <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "sleep", ms: "" })}>+ sleep</button>
+        <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "state", stateId: states[0]?.id ?? "" })}>+ state</button>
+        <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "stretch" })}>+ stretch</button>
+      </div>
+    </div>
+  );
+}
+
 function HotkeyModal({ initial, gameExe, states, onSave, onClose }: {
   initial: Hotkey;
   gameExe: string;
@@ -959,19 +1034,6 @@ function HotkeyModal({ initial, gameExe, states, onSave, onClose }: {
     setRecordingTrigger(false);
   });
 
-  function addStep(step: Step) { setSteps(s => [...s, step]); }
-  function removeStep(i: number) { setSteps(s => s.filter((_, idx) => idx !== i)); }
-  function updateStep(i: number, step: Step) { setSteps(s => s.map((x, idx) => idx === i ? step : x)); }
-  function moveStep(i: number, dir: -1 | 1) {
-    setSteps(s => {
-      const next = [...s];
-      const j = i + dir;
-      if (j < 0 || j >= next.length) return s;
-      [next[i], next[j]] = [next[j], next[i]];
-      return next;
-    });
-  }
-
   return (
     <div className="modal-overlay">
       <div className="modal modal--wide" onClick={e => e.stopPropagation()}>
@@ -989,32 +1051,7 @@ function HotkeyModal({ initial, gameExe, states, onSave, onClose }: {
           </button>
         </div>
 
-        <div className="steps-section">
-          <div className="steps-list">
-            {steps.map((step, i) => (
-              <StepRow key={i} step={step} index={i} total={steps.length} gameExe={gameExe} states={states}
-                onChange={s => updateStep(i, s)}
-                onDelete={() => removeStep(i)}
-                onMove={dir => moveStep(i, dir)} />
-            ))}
-            {steps.length === 0 && <div className="steps-empty">No steps yet</div>}
-          </div>
-          <div className="step-add-btns">
-            <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "borderless" })}>+ borderless</button>
-            <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "goto", x: "", y: "" })}>+ goto</button>
-            <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "hold", key: "" })}>+ hold</button>
-            <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "killprocess" })}>+ killprocess</button>
-            <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "lock" })}>+ lock</button>
-            <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "press", key: "" })}>+ press</button>
-            <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "repeat", key: "", interval: "100", hold: "6" })}>+ repeat</button>
-            <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "restorecursor" })}>+ restorecursor</button>
-            <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "savecursor" })}>+ savecursor</button>
-            <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "send", text: "" })}>+ send</button>
-            <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "sleep", ms: "" })}>+ sleep</button>
-            <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "state", stateId: states[0]?.id ?? "" })}>+ state</button>
-            <button className="btn btn--ghost btn--sm" onClick={() => addStep({ type: "stretch" })}>+ stretch</button>
-          </div>
-        </div>
+        <BehaviorStepsEditor steps={steps} gameExe={gameExe} states={states} onChange={setSteps} />
 
         <div className="modal__actions">
           <button className="btn btn--ghost" onClick={onClose}>Cancel</button>
@@ -1022,6 +1059,38 @@ function HotkeyModal({ initial, gameExe, states, onSave, onClose }: {
             onClick={() => trigger.trim() && onSave({ name: name.trim(), trigger: trigger.trim(), behavior: stepsToString(steps), state_id: null })}>
             Save
           </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function EventModal({ initial, eventKinds, gameExe, states, onSave, onClose }: {
+  initial: BehaviorEvent;
+  eventKinds: BehaviorEventKind[];
+  gameExe: string;
+  states: ProfileState[];
+  onSave: (event: BehaviorEvent) => void;
+  onClose: () => void;
+}) {
+  const [event, setEvent] = useState(initial.event);
+  const [steps, setSteps] = useState<Step[]>(() => parseSteps(initial.behavior));
+  const behavior = stepsToString(steps);
+
+  return (
+    <div className="modal-overlay">
+      <div className="modal modal--wide" onClick={e => e.stopPropagation()}>
+        <h2>{initial.behavior ? "Edit Event" : "Add Event"}</h2>
+        <select value={event} onChange={e => setEvent(e.target.value as BehaviorEventKind)} autoFocus>
+          {BEHAVIOR_EVENTS.filter(candidate => eventKinds.includes(candidate.value)).map(candidate => (
+            <option key={candidate.value} value={candidate.value}>{candidate.label}</option>
+          ))}
+        </select>
+        <BehaviorStepsEditor steps={steps} gameExe={gameExe} states={states} onChange={setSteps} />
+        <div className="modal__actions">
+          <button className="btn btn--ghost" onClick={onClose}>Cancel</button>
+          <button className="btn btn--primary" disabled={!behavior}
+            onClick={() => behavior && onSave({ event, behavior })}>Save</button>
         </div>
       </div>
     </div>
@@ -1173,11 +1242,15 @@ function hotkeyLabel(hotkey: Hotkey): string {
   return hotkey.name.trim() ? `${hotkey.name} - hotkey` : "hotkey";
 }
 
-function hotkeyDesc(hotkey: Hotkey, states: ProfileState[]): string {
-  const behavior = hotkey.behavior.replace(/state\(([^)]+)\)/g, (_, stateId: string) => {
+function behaviorDesc(behavior: string, states: ProfileState[]): string {
+  const description = behavior.replace(/state\(([^)]+)\)/g, (_, stateId: string) => {
     return `state(${stateNameById(states, stateId) ?? stateId})`;
   });
-  return behavior || "No behavior";
+  return description || "No behavior";
+}
+
+function hotkeyDesc(hotkey: Hotkey, states: ProfileState[]): string {
+  return behaviorDesc(hotkey.behavior, states);
 }
 
 function HotkeyRow({ hotkey, states, inherited, onEdit, onCopy, onDelete, onOverride }: {
@@ -1205,6 +1278,32 @@ function HotkeyRow({ hotkey, states, inherited, onEdit, onCopy, onDelete, onOver
             <button className="icon-btn" title="Edit" onClick={onEdit}>✏</button>
             <button className="icon-btn" title="Copy" onClick={onCopy}>⧉</button>
             <button className="icon-btn icon-btn--danger" title="Delete" onClick={onDelete}>✕</button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function EventRow({ event, states, inherited, onEdit, onDelete, onOverride }: {
+  event: BehaviorEvent;
+  states: ProfileState[];
+  inherited: boolean;
+  onEdit?: () => void;
+  onDelete?: () => void;
+  onOverride?: () => void;
+}) {
+  return (
+    <div className={`step-row${inherited ? " step-row--muted" : ""}`}>
+      <span className="overlay-type-badge overlay-type-badge--text">{behaviorEventLabel(event.event)}</span>
+      <span className="overlay-item-desc">{behaviorDesc(event.behavior, states)}</span>
+      <div className="step-row__btns">
+        {inherited ? (
+          <button className="icon-btn" title="Override" onClick={onOverride}>âœŽ</button>
+        ) : (
+          <>
+            <button className="icon-btn" title="Edit" onClick={onEdit}>âœ</button>
+            <button className="icon-btn icon-btn--danger" title="Delete" onClick={onDelete}>âœ•</button>
           </>
         )}
       </div>
@@ -1597,6 +1696,7 @@ function ProfileEditor({ folder, profile, showStates, onExitStates, onContext, o
 }) {
   const profileId = profile.id;
   const profileExe = folder.exe;
+  const eventTargetAvailable = hasSpecificAppTarget(profileExe);
 
   async function setArmed(armed: boolean) {
     try { onDb(await api.setProfileArmed(profile.id, armed)); } catch (e) { alert(String(e)); }
@@ -1607,11 +1707,15 @@ function ProfileEditor({ folder, profile, showStates, onExitStates, onContext, o
   async function deleteHotkey(index: number) {
     onDb(await api.upsertProfile(folder.id, { ...profile, hotkeys: profile.hotkeys.filter((_, i) => i !== index) }));
   }
+  async function deleteEvent(index: number) {
+    onDb(await api.upsertProfile(folder.id, { ...profile, events: profile.events.filter((_, i) => i !== index) }));
+  }
   async function saveScripts(scripts: Script[]) {
     try { onDb(await api.upsertProfile(folder.id, { ...profile, scripts })); } catch (e) { alert(String(e)); }
   }
 
   const resolvedHotkeys = resolveHotkeys(folder.profiles, profile);
+  const resolvedEvents = resolveEvents(folder.profiles, profile);
   const resolvedStates = resolveStates(folder.profiles, profile);
   const resolvedOverlayItems = resolveOverlayItems(folder.profiles, profile);
   const stateOptions = resolvedStates.map(({ state }) => state);
@@ -1685,6 +1789,39 @@ function ProfileEditor({ folder, profile, showStates, onExitStates, onContext, o
                 );
               })}
               {resolvedHotkeys.length === 0 && <div className="steps-empty">No hotkeys yet</div>}
+            </div>
+          </>
+        ) : profile.kind === "events" ? (
+          <>
+            <div className="section-head">
+              <h3>Events</h3>
+              <button className="btn btn--primary btn--sm"
+                disabled={!eventTargetAvailable || profile.events.length >= BEHAVIOR_EVENTS.length}
+                title={!eventTargetAvailable ? "Events require a specific app target" : undefined}
+                onClick={() => {
+                  const eventKinds = BEHAVIOR_EVENTS.map(candidate => candidate.value)
+                    .filter(event => !profile.events.some(existing => existing.event === event));
+                  if (eventKinds.length === 0) return;
+                  onModal({ type: "editEvent", gameId: folder.id, profileId, index: null,
+                    event: { event: eventKinds[0], behavior: "" }, eventKinds, gameExe: profileExe, states: stateOptions });
+                }}>
+                + Event
+              </button>
+            </div>
+            {!eventTargetAvailable && <div className="steps-empty">Events require a folder with a specific app target.</div>}
+            <div className="steps-list">
+              {resolvedEvents.map(({ event, own }) => {
+                const ownIndex = own ? profile.events.findIndex(candidate => candidate.event === event.event) : -1;
+                const eventKinds = BEHAVIOR_EVENTS.map(candidate => candidate.value)
+                  .filter(kind => kind === event.event || !profile.events.some((existing, index) => index !== ownIndex && existing.event === kind));
+                return (
+                  <EventRow key={event.event} event={event} states={stateOptions} inherited={!own}
+                    onEdit={own ? () => onModal({ type: "editEvent", gameId: folder.id, profileId, index: ownIndex, event, eventKinds, gameExe: profileExe, states: stateOptions }) : undefined}
+                    onDelete={own ? () => deleteEvent(ownIndex) : undefined}
+                    onOverride={!own ? () => saveProfile({ ...profile, events: [...profile.events, { ...event }] }) : undefined} />
+                );
+              })}
+              {resolvedEvents.length === 0 && eventTargetAvailable && <div className="steps-empty">No events yet</div>}
             </div>
           </>
         ) : profile.kind === "scripts" ? (
@@ -2074,6 +2211,7 @@ export default function App() {
     const hasProcessTarget = targetExe !== "" && !isGlobalExe(targetExe);
     return [
       { label: "New hotkeys profile", onClick: () => newProfile("hotkeys") },
+      ...(hasSpecificAppTarget(folder.exe) ? [{ label: "New events profile", onClick: () => newProfile("events") }] : []),
       { label: "New scripts profile", onClick: () => newProfile("scripts") },
       { label: "New overlay profile", onClick: () => newProfile("overlay") },
       { label: "Import profile…", onClick: async () => {
@@ -2228,6 +2366,19 @@ export default function App() {
     } catch (e) { alert(`Error saving hotkey: ${e}`); }
   }
 
+  async function handleEventSave(gameId: string, profileId: string, index: number | null, event: BehaviorEvent) {
+    try {
+      const game = db!.scopes.find(g => g.id === gameId)!;
+      const profile = game.profiles.find(p => p.id === profileId)!;
+      const events = [...profile.events];
+      if (index === null) events.push(event);
+      else events[index] = event;
+      const updated = await api.upsertProfile(gameId, { ...profile, events });
+      handleDb(updated);
+      setModal(null);
+    } catch (e) { alert(`Error saving event: ${e}`); }
+  }
+
   if (!db) {
     return <div className="loading">Loading…</div>;
   }
@@ -2306,6 +2457,12 @@ export default function App() {
         const { gameId, profileId: pid, index, hotkey, gameExe, states } = modal;
         return <HotkeyModal initial={hotkey} gameExe={gameExe} states={states}
           onSave={hk => handleHotkeySave(gameId, pid, index, hk)}
+          onClose={() => setModal(null)} />;
+      })()}
+      {modal?.type === "editEvent" && (() => {
+        const { gameId, profileId: pid, index, event, eventKinds, gameExe, states } = modal;
+        return <EventModal initial={event} eventKinds={eventKinds} gameExe={gameExe} states={states}
+          onSave={next => handleEventSave(gameId, pid, index, next)}
           onClose={() => setModal(null)} />;
       })()}
       {modal?.type === "copyHotkey" && (() => {

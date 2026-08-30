@@ -45,7 +45,7 @@ pub struct AppState {
     pub db_path: std::path::PathBuf,
     pub scripts_path: std::path::PathBuf,
     /// The single always-on AutoHotkey process holding the Copilot remap and every armed
-    /// profile's hotkeys, each gated to its folder's app via #HotIf. Regenerated + relaunched
+    /// profile's hotkeys and lifecycle events. Regenerated + relaunched
     /// whenever folders or profiles change.
     pub hotkeys_ahk: Mutex<ahk::AhkManager>,
     pub overlay_config: Mutex<config::OverlayConfig>,
@@ -295,7 +295,7 @@ fn delete_profile(state: State<AppState>, game_id: String, profile_id: String) -
     Ok(db)
 }
 
-/// Arm or disarm a profile. Arming makes its hotkeys/scripts live automatically whenever its
+/// Arm or disarm a profile. Arming makes its hotkeys/events/scripts live automatically whenever its
 /// folder's app is focused; multiple profiles can be armed at once.
 #[tauri::command]
 fn set_profile_armed(app: tauri::AppHandle, state: State<AppState>, profile_id: String, armed: bool) -> Result<Database, String> {
@@ -1599,41 +1599,6 @@ async fn download_and_install_update(app: tauri::AppHandle, url: String) -> Resu
     Ok(())
 }
 
-fn is_process_running(exe: &str) -> bool {
-    if is_global_game_exe(exe) {
-        return true;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        use winapi::shared::minwindef::FALSE;
-        use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
-        use winapi::um::tlhelp32::{
-            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW,
-            PROCESSENTRY32W, TH32CS_SNAPPROCESS,
-        };
-        let exe_lower = exe.to_lowercase();
-        unsafe {
-            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if snap == INVALID_HANDLE_VALUE { return false; }
-            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-            let mut found = false;
-            if Process32FirstW(snap, &mut entry) != FALSE {
-                loop {
-                    let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
-                    let name = String::from_utf16_lossy(&entry.szExeFile[..len]).to_lowercase();
-                    if name == exe_lower { found = true; break; }
-                    if Process32NextW(snap, &mut entry) == FALSE { break; }
-                }
-            }
-            CloseHandle(snap);
-            found
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    false
-}
-
 /// Look up a saved script by id across every scope and run it. Used by the AHK `/script`
 /// route (a hotkey fired) — failures are logged, not surfaced, since there is no UI in the loop.
 /// Spawn a script and place it in its owning profile's kill-on-close Job Object, so it — and
@@ -1708,10 +1673,6 @@ fn run_script_by_id(handle: &tauri::AppHandle, id: &str) {
 fn start_watcher(handle: tauri::AppHandle) {
     std::thread::spawn(move || {
         let mut last_tick = std::time::SystemTime::now();
-        // Per-armed-profile "was the folder app running last tick", so launch-triggered scripts fire
-        // once on the not-running -> running edge. A profile whose folder app is already running at
-        // first observation is seeded, so it doesn't fire retroactively.
-        let mut launch_running: HashMap<String, bool> = HashMap::new();
         let mut first_tick = true;
         loop {
             // Establish the process baseline immediately. Sleeping before the first observation
@@ -1738,27 +1699,6 @@ fn start_watcher(handle: tauri::AppHandle) {
                 Ok(db) => db,
                 Err(_) => continue,
             };
-
-            // Launch-triggered scripts: fire when an armed profile's folder app transitions to running.
-            for game in &db.games {
-                for profile in &game.profiles {
-                    let has_launch = profile.armed
-                        && profile.scripts.iter().any(|s| s.enabled && s.trigger == "launch");
-                    if !has_launch {
-                        launch_running.remove(&profile.id);
-                        continue;
-                    }
-                    let now_running = is_process_running(&game.exe);
-                    let was_running = launch_running.insert(profile.id.clone(), now_running);
-                    if was_running == Some(false) && now_running {
-                        for script in profile.scripts.iter().filter(|s| s.enabled && s.trigger == "launch") {
-                            if let Err(e) = spawn_tracked_script(&state, &db.settings, script, &profile.id) {
-                                eprintln!("[scripts] {e}");
-                            }
-                        }
-                    }
-                }
-            }
 
             // Keep the single hotkey/Copilot script alive and relaunch it after suspend. #HotIf
             // handles profile focus gating; the Copilot remap remains active with no profiles.
