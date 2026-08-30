@@ -2085,12 +2085,6 @@ export default function App() {
       { label: "Folder settings…", onClick: () => setModal({ type: "editGame", game: folder }) },
       { label: "Export folder", onClick: () => exportScope(folder).catch(e => alert(String(e))) },
       ...(hasProcessTarget ? [
-        { label: "Toggle borderless", onClick: async () => {
-          try { await api.toggleBorderless(targetExe); } catch (e) { alert(String(e)); }
-        } },
-        { label: "Toggle stretch", onClick: async () => {
-          try { await api.toggleStretch(targetExe); } catch (e) { alert(String(e)); }
-        } },
         { label: "Kill process", onClick: async () => {
           if (!confirm(`Force-kill "${targetExe}"?`)) return;
           try { await api.killGame(targetExe); } catch (e) { alert(String(e)); }
