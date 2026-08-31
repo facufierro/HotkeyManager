@@ -1299,11 +1299,11 @@ function EventRow({ event, states, inherited, onEdit, onDelete, onOverride }: {
       <span className="overlay-item-desc">{behaviorDesc(event.behavior, states)}</span>
       <div className="step-row__btns">
         {inherited ? (
-          <button className="icon-btn" title="Override" onClick={onOverride}>âœŽ</button>
+          <button className="icon-btn" title="Override" onClick={onOverride}>✎</button>
         ) : (
           <>
-            <button className="icon-btn" title="Edit" onClick={onEdit}>âœ</button>
-            <button className="icon-btn icon-btn--danger" title="Delete" onClick={onDelete}>âœ•</button>
+            <button className="icon-btn" title="Edit" onClick={onEdit}>✏</button>
+            <button className="icon-btn icon-btn--danger" title="Delete" onClick={onDelete}>✕</button>
           </>
         )}
       </div>
