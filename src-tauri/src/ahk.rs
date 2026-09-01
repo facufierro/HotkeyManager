@@ -299,28 +299,47 @@ pub struct ArmedProfile<'a> {
 /// Emit one armed profile's `#HotIf` block(s). Hotkeys/scripts sit under
 /// `WinActive("ahk_exe <exe>") && enabled["<id>"]` (or just `enabled["<id>"]` for exe "*") so
 /// they only fire while that app is focused; toggle keys sit under a focus-only gate so a
-/// disabled profile can still be re-enabled. `used_keys` is keyed by exe: the same key may be
-/// bound for different apps, but within one app the first armed profile wins it (a duplicate
-/// `X::` label under an identical #HotIf would fail to load and kill every hotkey).
+/// disabled profile can still be re-enabled. `used_keys` tracks each activating key plus its
+/// held prerequisites per exe: the same chord may be bound for different apps, but within one
+/// app the first armed profile wins it (a duplicate label under an identical #HotIf would fail
+/// to load and kill every hotkey).
 fn generate_profile_block(
     ap: &ArmedProfile,
     used_keys: &mut HashMap<String, HashSet<String>>,
+    hold_ups: &mut HashSet<String>,
     repeat_ups: &mut HashSet<String>,
-    repeat_up_lines: &mut String,
 ) -> String {
     let p = ap.profile;
     let exe = ap.exe.trim();
     let global_game = exe == GLOBAL_GAME_EXE;
     let id = escape_ahk_string(&p.id);
     let exe_esc = escape_ahk_string(exe);
-    let resolved = config::resolve_profile_hotkeys(ap.siblings, p);
+    let mut resolved = config::resolve_profile_hotkeys(ap.siblings, p);
+    // AutoHotkey chooses the first matching #HotIf variant for a key. Put the most specific
+    // chord first so "x y z" wins over "x z" while all three keys are down.
+    resolved.sort_by_key(|hotkey| std::cmp::Reverse(trigger_chord_keys(&hotkey.trigger).len()));
     let keyset = used_keys.entry(exe.to_string()).or_default();
     let mut lines = String::new();
+    let mut combo_blocks = String::new();
+    let enabled_condition = if global_game {
+        format!("enabled[\"{id}\"]")
+    } else {
+        format!("WinActive(\"ahk_exe {exe_esc}\") && enabled[\"{id}\"]")
+    };
+    let focus_condition = if global_game {
+        String::new()
+    } else {
+        format!("WinActive(\"ahk_exe {exe_esc}\")")
+    };
 
     for hk in resolved {
         let ahk_key = trigger_to_key(&hk.trigger);
         if ahk_key.is_empty() { continue; }
-        if !keyset.insert(ahk_key.clone()) { continue; }
+        let chord_keys = trigger_chord_keys(&hk.trigger);
+        let physical_chord_keys = trigger_physical_chord_keys(&hk.trigger);
+        let prerequisite_keys = chord_keys[..chord_keys.len().saturating_sub(1)].join(" ");
+        let binding_id = format!("{ahk_key}|{prerequisite_keys}");
+        if !keyset.insert(binding_id) { continue; }
         let trigger = escape_ahk_string(&hk.trigger);
         let trigger_modifiers = trigger_modifier_symbols(&hk.trigger);
         // The overlay only reacts to a hotkey_triggered ping for a binding that carries a
@@ -336,11 +355,23 @@ fn generate_profile_block(
 
         // A behavior that is exactly one hold(...) becomes a true held remap: the key stays
         // down while the hotkey is held, released by a paired wildcard key-up hotkey.
-        if let (Some(hold_arg), Some(up_key)) = (parse_pure_hold(&hk.behavior), up_hotkey(&hk.trigger)) {
+        if let Some(hold_arg) = parse_pure_hold(&hk.behavior) {
             let keys = escape_ahk_string(&hold_arg);
-            lines.push_str(&format!(
-                "{ahk_key}:: {{\n    HoldKeyDown(\"{keys}\", \"{trigger_modifiers}\")\n{notify}}}\n{up_key}:: HoldKeyUp(\"{keys}\", \"{trigger_modifiers}\")\n"
-            ));
+            let owner = escape_ahk_string(&format!("{}:{}", p.id, hk.trigger));
+            let chord = escape_ahk_string(&physical_chord_keys.join(" "));
+            let binding = format!(
+                "{ahk_key}:: {{\n    HoldChordDown(\"{owner}\", \"{keys}\", \"{chord}\", \"{trigger_modifiers}\")\n{notify}}}\n"
+            );
+            push_trigger_binding(
+                &mut lines,
+                &mut combo_blocks,
+                &enabled_condition,
+                &prerequisite_keys,
+                &binding,
+            );
+            for trigger_key in physical_chord_keys {
+                hold_ups.insert(trigger_key);
+            }
             continue;
         }
 
@@ -352,22 +383,26 @@ fn generate_profile_block(
             if !poll_key.is_empty() {
                 let keys = escape_ahk_string(&repeat_keys);
                 let poll_key = escape_ahk_string(&poll_key);
+                let chord = escape_ahk_string(&physical_chord_keys.join(" "));
                 let repeat_exe = if global_game { String::new() } else { exe_esc.clone() };
                 // A synthetic up for the trigger itself also changes Windows' asynchronous
                 // state, so skip that fallback for same-trigger output. The AHK hook remains
                 // installed for every repeat regardless.
                 let use_windows_state = !repeat_output_uses_trigger(&repeat_keys, &hk.trigger);
-                lines.push_str(&format!(
-                    "{ahk_key}:: {{\n    repeatDown[\"{poll_key}\"] := true\n{notify}    RepeatHold(\"{keys}\", {interval}, \"{poll_key}\", \"{repeat_exe}\", {hold}, \"{id}\", {use_windows_state}, \"{trigger_modifiers}\")\n}}\n"
-                ));
+                let binding = format!(
+                    "{ahk_key}:: {{\n    repeatDown[\"{poll_key}\"] := true\n    repeatChord[\"{poll_key}\"] := \"{chord}\"\n{notify}    RepeatHold(\"{keys}\", {interval}, \"{poll_key}\", \"{chord}\", \"{repeat_exe}\", {hold}, \"{id}\", {use_windows_state}, \"{trigger_modifiers}\")\n}}\n"
+                );
+                push_trigger_binding(
+                    &mut lines,
+                    &mut combo_blocks,
+                    &enabled_condition,
+                    &prerequisite_keys,
+                    &binding,
+                );
                 // One global key-up hotkey per physical key clears the repeat flag. `~` lets the
                 // native key-up through so normal typing of the key still works; keyed by the bare
                 // key because there is only one physical key regardless of how many triggers use it.
-                if repeat_ups.insert(poll_key.clone()) {
-                    repeat_up_lines.push_str(&format!(
-                        "~*{poll_key} up:: repeatDown[\"{poll_key}\"] := false\n"
-                    ));
-                }
+                repeat_ups.insert(poll_key);
                 continue;
             }
         }
@@ -377,39 +412,68 @@ fn generate_profile_block(
         // Run the behavior first, then notify the overlay (when a state_id makes the ping
         // meaningful): the ping is a blocking localhost request, so doing it after keeps a
         // busy backend from delaying the output.
-        lines.push_str(&format!(
+        let binding = format!(
             "{ahk_key}:: {{\n    ExecuteBehavior(\"{behavior}\", \"{trigger_modifiers}\", \"{behavior_exe}\")\n{notify}}}\n"
-        ));
+        );
+        push_trigger_binding(
+            &mut lines,
+            &mut combo_blocks,
+            &enabled_condition,
+            &prerequisite_keys,
+            &binding,
+        );
     }
 
     for script in &p.scripts {
         if !script.enabled || script.trigger != "hotkey" { continue; }
         let ahk_key = trigger_to_key(&script.hotkey);
-        if ahk_key.is_empty() || !keyset.insert(ahk_key.clone()) { continue; }
+        let chord_keys = trigger_chord_keys(&script.hotkey);
+        let prerequisite_keys = chord_keys[..chord_keys.len().saturating_sub(1)].join(" ");
+        let binding_id = format!("{ahk_key}|{prerequisite_keys}");
+        if ahk_key.is_empty() || !keyset.insert(binding_id) { continue; }
         let sid = escape_ahk_string(&script.id);
-        lines.push_str(&format!("{ahk_key}:: RunScript(\"{sid}\")\n"));
+        push_trigger_binding(
+            &mut lines,
+            &mut combo_blocks,
+            &enabled_condition,
+            &prerequisite_keys,
+            &format!("{ahk_key}:: RunScript(\"{sid}\")\n"),
+        );
     }
 
     // Toggle keys only bind when explicitly set; the overlay-toggle is skipped when it equals
     // the hotkeys-toggle. Both flip THIS profile's enabled flag, gated by focus only so a
     // disabled profile can be re-enabled from its own app.
-    let toggle_h = p.toggle_hotkeys_key.as_deref()
-        .and_then(|k| { let k = trigger_to_key(k); if k.is_empty() { None } else { Some(k) } });
-    let toggle_o = p.toggle_overlay_key.as_deref()
-        .and_then(|k| { let k = trigger_to_key(k); if k.is_empty() { None } else { Some(k) } })
-        .filter(|k| Some(k) != toggle_h.as_ref());
     let mut toggle_lines = String::new();
-    if let Some(k) = &toggle_h { toggle_lines.push_str(&format!("{k}:: ToggleEnabled(\"{id}\")\n")); }
-    if let Some(k) = &toggle_o { toggle_lines.push_str(&format!("{k}:: ToggleEnabled(\"{id}\")\n")); }
-
-    let mut out = String::new();
-    if !lines.is_empty() {
-        if global_game {
-            out.push_str(&format!("#HotIf enabled[\"{id}\"]\n{lines}#HotIf\n"));
-        } else {
-            out.push_str(&format!("#HotIf WinActive(\"ahk_exe {exe_esc}\") && enabled[\"{id}\"]\n{lines}#HotIf\n"));
+    let mut toggle_combo_blocks = String::new();
+    let mut toggle_bindings = HashSet::new();
+    for trigger in [p.toggle_hotkeys_key.as_deref(), p.toggle_overlay_key.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        let key = trigger_to_key(trigger);
+        if key.is_empty() {
+            continue;
         }
+        let chord_keys = trigger_chord_keys(trigger);
+        let prerequisite_keys = chord_keys[..chord_keys.len().saturating_sub(1)].join(" ");
+        if !toggle_bindings.insert(format!("{key}|{prerequisite_keys}")) {
+            continue;
+        }
+        push_trigger_binding(
+            &mut toggle_lines,
+            &mut toggle_combo_blocks,
+            &focus_condition,
+            &prerequisite_keys,
+            &format!("{key}:: ToggleEnabled(\"{id}\")\n"),
+        );
     }
+
+    let mut out = combo_blocks;
+    if !lines.is_empty() {
+        out.push_str(&format!("#HotIf {enabled_condition}\n{lines}#HotIf\n"));
+    }
+    out.push_str(&toggle_combo_blocks);
     if !toggle_lines.is_empty() {
         if global_game {
             out.push_str(&format!("#HotIf\n{toggle_lines}#HotIf\n"));
@@ -420,6 +484,26 @@ fn generate_profile_block(
     out
 }
 
+fn push_trigger_binding(
+    simple_lines: &mut String,
+    combo_blocks: &mut String,
+    base_condition: &str,
+    prerequisite_keys: &str,
+    binding: &str,
+) {
+    if prerequisite_keys.is_empty() {
+        simple_lines.push_str(binding);
+        return;
+    }
+    let prerequisite_keys = escape_ahk_string(prerequisite_keys);
+    let condition = if base_condition.is_empty() {
+        format!("TriggerChordHeld(\"{prerequisite_keys}\")")
+    } else {
+        format!("{base_condition} && TriggerChordHeld(\"{prerequisite_keys}\")")
+    };
+    combo_blocks.push_str(&format!("#HotIf {condition}\n{binding}#HotIf\n"));
+}
+
 /// Build ONE always-on AHK script for every armed profile, each gated to its own app.
 pub fn generate_combined_script(armed: &[ArmedProfile]) -> String {
     // Specific-exe blocks first, "*" last, so an app's binding takes precedence over a global
@@ -428,8 +512,8 @@ pub fn generate_combined_script(armed: &[ArmedProfile]) -> String {
     ordered.sort_by_key(|ap| ap.exe.trim() == GLOBAL_GAME_EXE);
 
     let mut used_keys: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut hold_ups: HashSet<String> = HashSet::new();
     let mut repeat_ups: HashSet<String> = HashSet::new();
-    let mut repeat_up_lines = String::new();
     let mut blocks = String::new();
     let mut enabled_init = String::new();
     let mut overlay_init = String::new();
@@ -444,7 +528,12 @@ pub fn generate_combined_script(armed: &[ArmedProfile]) -> String {
         let id = escape_ahk_string(&p.id);
         let exe_esc = escape_ahk_string(exe);
         enabled_init.push_str(&format!("enabled[\"{id}\"] := true\n"));
-        blocks.push_str(&generate_profile_block(ap, &mut used_keys, &mut repeat_ups, &mut repeat_up_lines));
+        blocks.push_str(&generate_profile_block(
+            ap,
+            &mut used_keys,
+            &mut hold_ups,
+            &mut repeat_ups,
+        ));
         // Only overlay-type profiles drive the overlay window; other profile kinds never
         // show it (otherwise an armed hotkeys profile would pop an empty overlay).
         if p.kind == "overlay" && !p.overlay_disabled {
@@ -496,6 +585,25 @@ pub fn generate_combined_script(armed: &[ArmedProfile]) -> String {
         }
     }
 
+    let mut release_keys: Vec<&String> = hold_ups.union(&repeat_ups).collect();
+    release_keys.sort();
+    let mut release_up_lines = String::new();
+    for key in release_keys {
+        let releases_repeat = repeat_ups.contains(key);
+        let releases_hold = hold_ups.contains(key);
+        let key = escape_ahk_string(key);
+        let mut actions = String::new();
+        if releases_repeat {
+            actions.push_str(&format!("    repeatDown[\"{key}\"] := false\n"));
+        }
+        if releases_hold {
+            actions.push_str(&format!("    ReleaseTriggerHolds(\"{key}\")\n"));
+        }
+        // This handler is global so release recovery survives profile/focus changes. Always
+        // pass the physical up through when no active owner suppressed its corresponding down.
+        release_up_lines.push_str(&format!("~*{key} up:: {{\n{actions}}}\n"));
+    }
+
     let header = format!(
         r###"#Requires AutoHotkey v2.0
 #SingleInstance Force
@@ -518,7 +626,10 @@ global targetStates := Map()
 global behaviorEventQueue := []
 global behaviorEventDraining := false
 global repeatDown := Map()
+global repeatChord := Map()
 global syntheticDown := Map()
+global chordHolds := Map()
+global heldOutputCounts := Map()
 global mirroredMouseDown := Map()
 global copilotState := "idle"
 global copilotShiftSuppressed := false
@@ -712,12 +823,13 @@ SetTimer CheckHookHealth, 1000
 ; The key-up hotkey is the primary release signal. This independent owner-scoped monitor
 ; clears a repeat if that hotkey is ever delayed or displaced by another hook callback.
 CheckRepeatReleases(*) {{
-    global repeatDown
+    global repeatDown, repeatChord
     anyDown := false
     for triggerKey, down in repeatDown {{
         if !down
             continue
-        if GetKeyState(triggerKey, "P")
+        chord := repeatChord.Has(triggerKey) ? repeatChord[triggerKey] : triggerKey
+        if TriggerChordHeld(chord)
             anyDown := true
         else
             repeatDown[triggerKey] := false
@@ -895,7 +1007,7 @@ $*SC06E up::{{
     ReleaseCopilotCtrl()
 }}
 
-{repeat_up_lines}
+{release_up_lines}
 {blocks}
 "###
     );
@@ -971,12 +1083,15 @@ fn parse_pure_repeat(behavior: &str) -> Option<(String, u64, u64)> {
 }
 
 fn repeat_output_uses_trigger(repeat_keys: &str, trigger: &str) -> bool {
-    let trigger_key = repeat_comparison_key(&trigger_bare_key(trigger));
-    !trigger_key.is_empty()
-        && repeat_keys
-            .split_whitespace()
-            .map(|part| repeat_comparison_key(&trigger_bare_key(part)))
-            .any(|repeat_key| repeat_key == trigger_key)
+    let trigger_keys: Vec<String> = trigger_physical_chord_keys(trigger)
+        .iter()
+        .map(|key| repeat_comparison_key(key))
+        .collect();
+    !trigger_keys.is_empty()
+        && repeat_keys.split_whitespace().any(|part| {
+            let repeat_key = repeat_comparison_key(&trigger_bare_key(part));
+            trigger_keys.contains(&repeat_key)
+        })
 }
 
 fn repeat_comparison_key(key: &str) -> String {
@@ -1013,12 +1128,51 @@ fn trigger_modifier_symbols(trigger: &str) -> String {
     symbols
 }
 
-/// The wildcard key-up hotkey that releases a held remap, e.g. trigger "shift win f23"
-/// -> "*F23 up". `*` makes it fire on the key release regardless of modifier state.
-/// Returns None when the trigger resolves to no key.
-fn up_hotkey(trigger: &str) -> Option<String> {
-    let key = trigger_bare_key(trigger);
-    if key.is_empty() { None } else { Some(format!("*{key} up")) }
+fn is_trigger_modifier(part: &str) -> bool {
+    matches!(
+        part,
+        "ctrl" | "lctrl" | "rctrl"
+            | "shift" | "lshift" | "rshift"
+            | "alt" | "lalt" | "ralt"
+            | "win" | "lwin" | "rwin"
+    )
+}
+
+fn normalize_trigger_key(mut key: String) -> String {
+    if let Some(rest) = key.strip_prefix('f') {
+        if rest.parse::<u32>().is_ok() {
+            key = format!("F{rest}");
+        }
+    }
+    if let Some(sc) = layout_scancode(&key).or_else(|| us_scancode(&key).map(String::from)) {
+        key = sc;
+    }
+    key
+}
+
+/// Every non-modifier in a trigger, converted to the physical key name used by AHK.
+/// The final key activates the binding; all earlier keys form its held chord condition.
+fn trigger_chord_keys(trigger: &str) -> Vec<String> {
+    trigger
+        .trim()
+        .to_lowercase()
+        .split_whitespace()
+        .filter(|part| !is_trigger_modifier(part))
+        .map(|part| normalize_trigger_key(part.to_string()))
+        .collect()
+}
+
+fn trigger_physical_chord_keys(trigger: &str) -> Vec<String> {
+    let keys = trigger_chord_keys(trigger);
+    if !keys.is_empty() {
+        return keys;
+    }
+    let modifier_key = trigger_bare_key(trigger);
+    if modifier_key.is_empty() {
+        Vec::new()
+    } else {
+        vec![modifier_key]
+    }
 }
 
 /// The bare key of a trigger with modifiers stripped, AHK-cased: "shift win f23" ->
@@ -1047,15 +1201,7 @@ fn trigger_bare_key(trigger: &str) -> String {
     if key.is_empty() {
         return modifier_key;
     }
-    if let Some(rest) = key.strip_prefix('f') {
-        if rest.parse::<u32>().is_ok() {
-            key = format!("F{rest}");
-        }
-    }
-    if let Some(sc) = layout_scancode(&key).or_else(|| us_scancode(&key).map(String::from)) {
-        key = sc;
-    }
-    key
+    normalize_trigger_key(key)
 }
 
 /// Scancode of the key that produces this character on the user's active keyboard
@@ -1145,15 +1291,7 @@ fn trigger_to_key(trigger: &str) -> String {
         return format!("{wild}{modifier_key}");
     }
 
-    if let Some(rest) = key.strip_prefix('f') {
-        if rest.parse::<u32>().is_ok() {
-            key = format!("F{rest}");
-        }
-    }
-
-    if let Some(sc) = layout_scancode(&key).or_else(|| us_scancode(&key).map(String::from)) {
-        key = sc;
-    }
+    key = normalize_trigger_key(key);
 
     format!("${wild}{mods}{key}")
 }
@@ -1626,34 +1764,137 @@ ReleaseModifier(modKey, owned, preserveHooks := false, blind := "{Blind}") {
         SendOwnedKeyUp(modKey, preserveHooks, blind)
 }
 
-; A held remap. The press hotkey calls HoldKeyDown and a paired wildcard key-up
-; hotkey calls HoldKeyUp, so the key stays down for exactly as long as the trigger is
-; held (e.g. a forced Copilot key behaving as Ctrl). This mirrors how AutoHotkey
-; implements native key remapping:
+; True while every physical keyboard key or mouse button in a recorded chord remains down.
+; #HotIf uses this for the keys before the final activating key, and held/repeat actions use
+; the full chord so releasing any member ends the action.
+TriggerChordHeld(chordKeys) {
+    for keyName in StrSplit(chordKeys, " ") {
+        if (keyName != "" && !GetKeyState(keyName, "P"))
+            return false
+    }
+    return chordKeys != ""
+}
+
+; A held remap. Its trigger owns one reference to every output until the primary key-up
+; hotkey or the independent physical-release monitor observes that the trigger is no longer
+; held. Reference counts let several triggers safely hold the same output. This mirrors how
+; AutoHotkey implements native key remapping:
 ;   - Blind exclusions suppress trigger modifiers only for the output key event, then restore
 ;     them so a held modifier can activate another hotkey without being pressed again.
-;   - DownR re-presses the key on the hardware's auto-repeat so it stays down.
-; A key-up hotkey is the only reliable release signal: the press hotkey suppresses
-; the trigger, so its logical/physical state can't be polled for release.
+;   - Each physical trigger owns one output reference. Hardware auto-repeat is ignored so a held
+;     output remains one uninterrupted down rather than repeating while the trigger stays held.
+; Global key-up handlers release owners independently of profile enabled/focus conditions.
 HoldKeyDown(keyStr, triggerModifiers := "") {
+    SetKeyDelay -1, -1
+    SetMouseDelay -1
     blind := BlindFor(triggerModifiers, KeyModifierSymbols(keyStr))
-    for k in HoldKeyList(keyStr)
-        SendOwnedKeyDown(k, true, "DownR", blind)
+    keys := HoldKeyList(keyStr)
+    for index, keyName in keys {
+        AcquireHeldOutput(keyName, blind)
+        ; Preserve the configured order as distinct transitions: the first output remains down
+        ; before the next one is pressed. Some games miss simultaneous synthetic mouse downs.
+        if (index < keys.Length)
+            Sleep 30
+    }
 }
 
 HoldKeyUp(keyStr, triggerModifiers := "") {
+    SetKeyDelay -1, -1
+    SetMouseDelay -1
     keys := HoldKeyList(keyStr)
     blind := BlindFor(triggerModifiers, KeyModifierSymbols(keyStr))
-    i := keys.Length
-    while (i >= 1) {
-        SendOwnedKeyUp(keys[i], true, blind)
-        i--
+    ReleaseHeldOutputsTogether(keys, blind)
+}
+
+AcquireHeldOutput(keyName, blind) {
+    global heldOutputCounts
+    count := heldOutputCounts.Has(keyName) ? heldOutputCounts[keyName] : 0
+    heldOutputCounts[keyName] := count + 1
+    if (count = 0)
+        SendOwnedKeyDown(keyName, true, "DownR", blind)
+}
+
+ReleaseHeldOutputsTogether(keys, blind) {
+    global heldOutputCounts, syntheticDown
+    releases := []
+    index := keys.Length
+    while (index >= 1) {
+        keyName := keys[index]
+        if heldOutputCounts.Has(keyName) {
+            count := heldOutputCounts[keyName]
+            if (count > 1)
+                heldOutputCounts[keyName] := count - 1
+            else {
+                heldOutputCounts.Delete(keyName)
+                releases.Push(keyName)
+            }
+        }
+        index--
     }
+    if (releases.Length = 0)
+        return
+
+    ; Send every releasable output in one event batch with all inter-event delays disabled.
+    ; Windows still represents individual ups, but no sleep or separate Send call can split them.
+    events := blind
+    for keyName in releases
+        events .= "{" keyName " Up}"
+    SendKeyEvents(events, true)
+    for keyName in releases {
+        if syntheticDown.Has(keyName)
+            syntheticDown.Delete(keyName)
+    }
+}
+
+; Track every single-key or multi-input trigger independently. Global key-up handlers call
+; ReleaseTriggerHolds for every physical member, so releasing any member ends its whole chord.
+HoldChordDown(owner, keyStr, chordKeys, triggerModifiers := "") {
+    global chordHolds
+    ; Keep a trigger-up buffered until the ordered down sequence is complete. Otherwise a quick
+    ; release during its inter-key delay could release the first output before the second is owned.
+    previousCritical := Critical()
+    try {
+        ; Hardware auto-repeat invokes the press hotkey again while the trigger stays down.
+        ; The existing owner represents that uninterrupted hold, so emit no additional downs.
+        if chordHolds.Has(owner)
+            return
+        chordHolds[owner] := Map(
+            "keys", keyStr,
+            "chord", chordKeys,
+            "modifiers", triggerModifiers
+        )
+        HoldKeyDown(keyStr, triggerModifiers)
+    } finally {
+        Critical previousCritical
+    }
+}
+
+HoldChordUp(owner) {
+    global chordHolds
+    if !chordHolds.Has(owner)
+        return
+    state := chordHolds[owner]
+    chordHolds.Delete(owner)
+    HoldKeyUp(state["keys"], state["modifiers"])
+}
+
+ReleaseTriggerHolds(triggerKey) {
+    global chordHolds
+    released := []
+    for owner, state in chordHolds {
+        for chordKey in StrSplit(state["chord"], " ") {
+            if (chordKey = triggerKey) {
+                released.Push(owner)
+                break
+            }
+        }
+    }
+    for owner in released
+        HoldChordUp(owner)
 }
 
 HoldKeyList(keyStr) {
     held := []
-    key := ""
     for part in StrSplit(Trim(StrLower(keyStr)), " ") {
         if (part = "ctrl")
             held.Push("Ctrl")
@@ -1679,13 +1920,12 @@ HoldKeyList(keyStr) {
             held.Push("LWin")
         else if (part = "rwin")
             held.Push("RWin")
-        else
-            key := part
+        else {
+            if RegExMatch(part, "i)^f(\d+)$", &m)
+                part := "F" m[1]
+            held.Push(PhysKey(part))
+        }
     }
-    if RegExMatch(key, "i)^f(\d+)$", &m)
-        key := "F" m[1]
-    if (key != "")
-        held.Push(PhysKey(key))
     return held
 }
 
@@ -1728,7 +1968,7 @@ SpinHold(ms) {
 ; it, so there is only ever one loop and the rate is the interval, not the OS repeat rate.
 ; Each press holds the key down for exactly `holdMs` (precise busy-wait), tunable so a game
 ; that reads the key per frame can be made to register exactly one press per interval.
-RepeatHold(keys, interval, triggerKey, exe, holdMs, enabledKey, useWindowsState, triggerModifiers := "") {
+RepeatHold(keys, interval, triggerKey, triggerChord, exe, holdMs, enabledKey, useWindowsState, triggerModifiers := "") {
     global enabled, repeatDown
     ; Stop as soon as EITHER release signal fires: the key-up hotkey clearing repeatDown, or
     ; the independent Windows state poll. GetKeyState(..., "P") reads AutoHotkey's hook state,
@@ -1737,7 +1977,7 @@ RepeatHold(keys, interval, triggerKey, exe, holdMs, enabledKey, useWindowsState,
     ; skipped when the repeated output includes the trigger itself, because that synthetic input
     ; legitimately changes the OS state; the key-up latch and hook state still cover that case.
     SetTimer CheckRepeatReleases, 10
-    while ((repeatDown.Has(triggerKey) && repeatDown[triggerKey]) && RepeatTriggerPhysicallyDown(triggerKey, useWindowsState)) {
+    while ((repeatDown.Has(triggerKey) && repeatDown[triggerKey]) && TriggerChordPhysicallyDown(triggerChord, useWindowsState)) {
         ; Toggling the profile off or leaving its target app ends this press. Retaining the
         ; loop across a focus change lets a missed key-up leave a stale repeat ready to resume.
         if (!enabled[enabledKey] || (exe != "" && !WinActive("ahk_exe " exe))) {
@@ -1754,7 +1994,15 @@ RepeatHold(keys, interval, triggerKey, exe, holdMs, enabledKey, useWindowsState,
     repeatDown[triggerKey] := false
 }
 
-RepeatTriggerPhysicallyDown(triggerKey, useWindowsState) {
+TriggerChordPhysicallyDown(triggerChord, useWindowsState) {
+    for triggerKey in StrSplit(triggerChord, " ") {
+        if (triggerKey != "" && !TriggerPhysicallyDown(triggerKey, useWindowsState))
+            return false
+    }
+    return triggerChord != ""
+}
+
+TriggerPhysicallyDown(triggerKey, useWindowsState) {
     static mouseButtonsSwapped := DllCall("GetSystemMetrics", "Int", 23)
     if !GetKeyState(triggerKey, "P")
         return false
@@ -1777,8 +2025,8 @@ RepeatTriggerPhysicallyDown(triggerKey, useWindowsState) {
 #[cfg(test)]
 mod tests {
     use super::{
-        generate_combined_script, repeat_output_uses_trigger, trigger_modifier_symbols,
-        ArmedProfile,
+        generate_combined_script, repeat_output_uses_trigger, trigger_chord_keys,
+        trigger_modifier_symbols, ArmedProfile,
     };
     use crate::config::{BehaviorEvent, Hotkey, Profile, Script};
 
@@ -1852,6 +2100,127 @@ mod tests {
         assert!(script.contains("SendBehaviorCommand(\"killprocess\", configuredExe)"));
         assert!(script.contains("SendBehaviorCommand(\"stretch\", configuredExe)"));
         assert!(script.contains("targetExe := WinGetProcessName(\"A\")"));
+    }
+
+    #[test]
+    fn regular_keys_and_mouse_buttons_can_be_held_as_trigger_chords() {
+        let mut profile = profile_with_hotkey("x y", "press(Home)");
+        profile.hotkeys.push(Hotkey {
+            name: String::new(),
+            trigger: "XButton1 y".to_string(),
+            behavior: "press(End)".to_string(),
+            state_id: None,
+        });
+        let armed = [ArmedProfile {
+            siblings: std::slice::from_ref(&profile),
+            profile: &profile,
+            exe: "*",
+        }];
+        let script = generate_combined_script(&armed);
+        let x = &trigger_chord_keys("x")[0];
+        let y = &trigger_chord_keys("y")[0];
+
+        assert!(script.contains(&format!(
+            "#HotIf enabled[\"test-profile\"] && TriggerChordHeld(\"{x}\")\n${y}::"
+        )));
+        assert!(script.contains(&format!(
+            "#HotIf enabled[\"test-profile\"] && TriggerChordHeld(\"xbutton1\")\n${y}::"
+        )));
+        assert!(script.contains("TriggerChordHeld(chordKeys)"));
+    }
+
+    #[test]
+    fn held_and_repeating_chords_end_when_any_trigger_key_is_released() {
+        let mut profile = profile_with_hotkey("x y", "hold(rctrl)");
+        profile.hotkeys.push(Hotkey {
+            name: String::new(),
+            trigger: "XButton1 f4".to_string(),
+            behavior: "repeat(f5, 100, 6)".to_string(),
+            state_id: None,
+        });
+        let armed = [ArmedProfile {
+            siblings: std::slice::from_ref(&profile),
+            profile: &profile,
+            exe: "*",
+        }];
+        let script = generate_combined_script(&armed);
+        let x = &trigger_chord_keys("x")[0];
+        let y = &trigger_chord_keys("y")[0];
+
+        assert!(script.contains(&format!(
+            "HoldChordDown(\"test-profile:x y\", \"rctrl\", \"{x} {y}\", \"\")"
+        )));
+        assert!(script.contains(&format!(
+            "~*{x} up:: {{\n    ReleaseTriggerHolds(\"{x}\")"
+        )));
+        assert!(script.contains(&format!(
+            "~*{y} up:: {{\n    ReleaseTriggerHolds(\"{y}\")"
+        )));
+        assert!(script.contains("repeatChord[\"F4\"] := \"xbutton1 F4\""));
+        assert!(script.contains(
+            "RepeatHold(\"f5\", 100, \"F4\", \"xbutton1 F4\", \"\", 6, \"test-profile\", true, \"\")"
+        ));
+        assert!(script.contains("TriggerChordPhysicallyDown(triggerChord, useWindowsState)"));
+    }
+
+    #[test]
+    fn hold_actions_keep_every_recorded_regular_key_and_mouse_button() {
+        let mut profile = profile_with_hotkey("x", "hold(XButton1 RButton)");
+        profile.hotkeys.push(Hotkey {
+            name: String::new(),
+            trigger: "z".to_string(),
+            behavior: "hold(XButton1 RButton)".to_string(),
+            state_id: None,
+        });
+        let armed = [ArmedProfile {
+            siblings: std::slice::from_ref(&profile),
+            profile: &profile,
+            exe: "*",
+        }];
+        let script = generate_combined_script(&armed);
+        let hold_key_list = script
+            .split_once("HoldKeyList(keyStr) {")
+            .unwrap()
+            .1
+            .split_once("KeyModifierSymbols(keyStr) {")
+            .unwrap()
+            .0;
+        let x = &trigger_chord_keys("x")[0];
+        let z = &trigger_chord_keys("z")[0];
+
+        assert!(script.contains(&format!(
+            "HoldChordDown(\"test-profile:x\", \"XButton1 RButton\", \"{x}\", \"\")"
+        )));
+        assert!(script.contains(&format!(
+            "HoldChordDown(\"test-profile:z\", \"XButton1 RButton\", \"{z}\", \"\")"
+        )));
+        assert!(script.contains(&format!(
+            "~*{x} up:: {{\n    ReleaseTriggerHolds(\"{x}\")"
+        )));
+        assert!(script.contains(&format!(
+            "~*{z} up:: {{\n    ReleaseTriggerHolds(\"{z}\")"
+        )));
+        assert!(hold_key_list.contains("held.Push(PhysKey(part))"));
+        assert!(!hold_key_list.contains("key := part"));
+        assert!(script.contains("global heldOutputCounts := Map()"));
+        assert!(script.contains("heldOutputCounts[keyName] := count + 1"));
+        assert!(script.contains("if (count > 1)"));
+        assert!(script.contains(
+            "if chordHolds.Has(owner)\n            return"
+        ));
+        assert!(script.contains("previousCritical := Critical()"));
+        assert!(script.contains("} finally {\n        Critical previousCritical"));
+        assert!(!script.contains("ReassertHeldOutputs"));
+        assert!(script.contains(
+            "AcquireHeldOutput(keyName, blind)\n        ; Preserve the configured order"
+        ));
+        assert!(script.contains("if (index < keys.Length)\n            Sleep 30"));
+        assert!(script.contains("ReleaseHeldOutputsTogether(keys, blind)"));
+        assert!(script.contains(
+            "for keyName in releases\n        events .= \"{\" keyName \" Up}\"\n    SendKeyEvents(events, true)"
+        ));
+        assert!(script.contains("ReleaseTriggerHolds(triggerKey)"));
+        assert!(!script.contains("CheckChordHoldReleases"));
     }
 
     #[test]
@@ -1929,9 +2298,9 @@ mod tests {
     fn repeat_release_check_uses_independent_state_when_safe() {
         let script = generate_combined_script(&[]);
 
-        assert!(script.contains("RepeatTriggerPhysicallyDown(triggerKey, useWindowsState)"));
+        assert!(script.contains("TriggerChordPhysicallyDown(triggerChord, useWindowsState)"));
         assert!(script.contains("DllCall(\"GetAsyncKeyState\", \"Int\", vk, \"Short\") & 0x8000"));
-        assert!(script.contains("&& RepeatTriggerPhysicallyDown(triggerKey, useWindowsState)"));
+        assert!(script.contains("&& TriggerChordPhysicallyDown(triggerChord, useWindowsState)"));
         assert!(script.contains("DllCall(\"GetSystemMetrics\", \"Int\", 23)"));
         assert!(script.contains("DoPress(keys, holdMs, true, true, triggerModifiers)"));
         assert!(script.contains("if preserveHooks\n        SendEvent(keys)"));
@@ -1962,8 +2331,8 @@ mod tests {
         ));
         assert!(script.contains("syntheticDown[keyName] := true"));
         assert!(script.contains("if !GetKeyState(keyName, \"P\")\n            SendEvent"));
-        assert!(script.contains("SendOwnedKeyDown(k, true, \"DownR\", blind)"));
-        assert!(script.contains("SendOwnedKeyUp(keys[i], true, blind)"));
+        assert!(script.contains("AcquireHeldOutput(k, blind)"));
+        assert!(script.contains("ReleaseHeldOutputsTogether(keys, blind)"));
         assert!(script.contains("global mirroredMouseDown := Map()"));
         assert!(script.contains("MirrorPhysicalMouseDown(phys, preserveHooks)"));
         assert!(script.contains("SetTimer CheckMirroredMouseReleases, 10"));
