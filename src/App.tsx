@@ -299,7 +299,7 @@ function toAhkMouseButton(e: MouseEvent, activeSideModifiers: Set<string>): stri
   return [...bindingModifiers(e, activeSideModifiers), button].join(" ");
 }
 
-function useBindingRecorder(recording: boolean, onCapture: (value: string) => void) {
+function useBindingRecorder(recording: boolean, onCapture: (value: string) => void, allowChord = false) {
   const onCaptureRef = useRef(onCapture);
   const activeSideModifiersRef = useRef<Set<string>>(new Set());
   onCaptureRef.current = onCapture;
@@ -307,8 +307,29 @@ function useBindingRecorder(recording: boolean, onCapture: (value: string) => vo
   useEffect(() => {
     if (!recording) return;
 
+    const heldInputs = new Map<string, string>();
+    const chordInputs: string[] = [];
+    const chordModifiers: string[] = [];
+    const rememberModifiers = (mods: string[]) => {
+      for (const mod of mods) {
+        if (!chordModifiers.includes(mod)) chordModifiers.push(mod);
+      }
+    };
     const capture = (value: string) => {
       if (value) onCaptureRef.current(value);
+    };
+    const rememberInput = (id: string, value: string) => {
+      if (heldInputs.has(id)) return;
+      const parts = value.split(/\s+/);
+      const key = parts.pop();
+      if (!key) return;
+      rememberModifiers(parts);
+      heldInputs.set(id, key);
+      chordInputs.push(key);
+    };
+    const releaseInput = (id: string) => {
+      if (!heldInputs.delete(id) || heldInputs.size > 0 || chordInputs.length === 0) return;
+      capture([...chordModifiers, ...chordInputs].join(" "));
     };
     const keyHandler = (e: KeyboardEvent) => {
       e.preventDefault();
@@ -316,18 +337,40 @@ function useBindingRecorder(recording: boolean, onCapture: (value: string) => vo
       const sideMod = sideModifier(e.code);
       if (sideMod) {
         activeSideModifiersRef.current.add(sideMod);
+        if (allowChord && !chordModifiers.includes(sideMod)) chordModifiers.push(sideMod);
         return;
       }
-      capture(toAhkKey(e, activeSideModifiersRef.current));
+      const value = toAhkKey(e, activeSideModifiersRef.current);
+      if (allowChord) rememberInput(`key:${e.code}`, value);
+      else capture(value);
     };
     const keyUpHandler = (e: KeyboardEvent) => {
-      const sideMod = sideModifier(e.code);
-      if (sideMod) activeSideModifiersRef.current.delete(sideMod);
-    };
-    const mouseHandler = (e: MouseEvent) => {
       e.preventDefault();
       e.stopImmediatePropagation();
-      capture(toAhkMouseButton(e, activeSideModifiersRef.current));
+      const sideMod = sideModifier(e.code);
+      if (sideMod) {
+        activeSideModifiersRef.current.delete(sideMod);
+        if (allowChord && chordInputs.length === 0 && activeSideModifiersRef.current.size === 0) {
+          const modifiers = chordModifiers.includes("ralt")
+            ? chordModifiers.filter(mod => mod !== "lctrl")
+            : chordModifiers;
+          capture(modifiers.join(" "));
+        }
+        return;
+      }
+      if (allowChord) releaseInput(`key:${e.code}`);
+    };
+    const mouseDownHandler = (e: MouseEvent) => {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      const value = toAhkMouseButton(e, activeSideModifiersRef.current);
+      if (allowChord) rememberInput(`mouse:${e.button}`, value);
+      else capture(value);
+    };
+    const mouseUpHandler = (e: MouseEvent) => {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      if (allowChord) releaseInput(`mouse:${e.button}`);
     };
     const contextMenuHandler = (e: MouseEvent) => {
       e.preventDefault();
@@ -336,27 +379,36 @@ function useBindingRecorder(recording: boolean, onCapture: (value: string) => vo
 
     window.addEventListener("keydown", keyHandler, true);
     window.addEventListener("keyup", keyUpHandler, true);
-    window.addEventListener("mousedown", mouseHandler, true);
+    window.addEventListener("mousedown", mouseDownHandler, true);
+    window.addEventListener("mouseup", mouseUpHandler, true);
     window.addEventListener("contextmenu", contextMenuHandler, true);
     return () => {
       activeSideModifiersRef.current.clear();
       window.removeEventListener("keydown", keyHandler, true);
       window.removeEventListener("keyup", keyUpHandler, true);
-      window.removeEventListener("mousedown", mouseHandler, true);
+      window.removeEventListener("mousedown", mouseDownHandler, true);
+      window.removeEventListener("mouseup", mouseUpHandler, true);
       window.removeEventListener("contextmenu", contextMenuHandler, true);
     };
-  }, [recording]);
+  }, [recording, allowChord]);
 }
 
-function KeyInput({ value, onChange, placeholder = "Key" }: { value: string; onChange: (v: string) => void; placeholder?: string }) {
+function KeyInput({ value, onChange, placeholder = "Key", allowChord = false }: {
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  allowChord?: boolean;
+}) {
   const [recording, setRecording] = useState(false);
   useBindingRecorder(recording, key => {
     onChange(key);
     setRecording(false);
-  });
+  }, allowChord);
 
   return recording ? (
-    <div className="key-recording">Press any key or mouse button…</div>
+    <div className="key-recording">
+      {allowChord ? "Hold the key/button combination, then release…" : "Press any key or mouse button…"}
+    </div>
   ) : (
     <div className="input-row" style={{ margin: 0, flex: 1 }}>
       <input value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder} />
@@ -808,10 +860,10 @@ function ProfileSettingsModal({ initial, onSave, onClose }: {
           </label>
         )}
         {kind === "hotkeys" && (
-          <KeyInput value={toggleHotkeysKey} onChange={setToggleHotkeysKey} placeholder="Enable-hotkeys key" />
+          <KeyInput value={toggleHotkeysKey} onChange={setToggleHotkeysKey} placeholder="Enable-hotkeys key" allowChord />
         )}
         {kind === "overlay" && (
-          <KeyInput value={toggleOverlayKey} onChange={setToggleOverlayKey} placeholder="Toggle-overlay key" />
+          <KeyInput value={toggleOverlayKey} onChange={setToggleOverlayKey} placeholder="Toggle-overlay key" allowChord />
         )}
         <div className="modal__actions">
           <button className="btn btn--ghost" onClick={onClose}>Cancel</button>
@@ -924,7 +976,11 @@ function StepRow({ step, index, total, gameExe, states, onChange, onDelete, onMo
       <span className="step-row__type">{step.type}</span>
       <div className="step-row__params">
         {(step.type === "press" || step.type === "hold") && (
-          <KeyInput value={step.key} onChange={key => onChange({ ...step, key })} />
+          <KeyInput
+            value={step.key}
+            onChange={key => onChange({ ...step, key })}
+            allowChord={step.type === "hold"}
+          />
         )}
         {step.type === "repeat" && (
           <>
@@ -1032,7 +1088,7 @@ function HotkeyModal({ initial, gameExe, states, onSave, onClose }: {
   useBindingRecorder(recordingTrigger, key => {
     setTrigger(key);
     setRecordingTrigger(false);
-  });
+  }, true);
 
   return (
     <div className="modal-overlay">
@@ -1043,7 +1099,7 @@ function HotkeyModal({ initial, gameExe, states, onSave, onClose }: {
 
         <div className="input-row">
           {recordingTrigger
-            ? <div className="key-recording">Press any key or mouse combination…</div>
+            ? <div className="key-recording">Hold the key/button combination, then release…</div>
             : <input value={trigger} onChange={e => setTrigger(e.target.value)} placeholder="Trigger" />
           }
           <button className="btn btn--ghost btn--sm" onClick={() => setRecordingTrigger(r => !r)}>
@@ -1644,7 +1700,7 @@ function ScriptModal({ initial, onSave, onClose }: {
         </select>
 
         {trigger === "hotkey" && (
-          <KeyInput value={hotkey} onChange={setHotkey} placeholder="Hotkey" />
+          <KeyInput value={hotkey} onChange={setHotkey} placeholder="Hotkey" allowChord />
         )}
 
         <select value={language} onChange={e => setLanguage(e.target.value as Script["language"])}>
