@@ -375,6 +375,30 @@ fn generate_profile_block(
             continue;
         }
 
+        // A multi-step behavior containing hold(...) runs its one-shot steps once, while each
+        // hold action remains down until the trigger is released. Registering the whole behavior
+        // as one owner also suppresses hardware auto-repeat from replaying its press actions.
+        if has_compound_hold(&hk.behavior) {
+            let behavior = escape_ahk_string(&hk.behavior);
+            let owner = escape_ahk_string(&format!("{}:{}", p.id, hk.trigger));
+            let chord = escape_ahk_string(&physical_chord_keys.join(" "));
+            let behavior_exe = escape_ahk_string(exe);
+            let binding = format!(
+                "{ahk_key}:: {{\n    HoldBehaviorDown(\"{owner}\", \"{behavior}\", \"{chord}\", \"{trigger_modifiers}\", \"{behavior_exe}\")\n{notify}}}\n"
+            );
+            push_trigger_binding(
+                &mut lines,
+                &mut combo_blocks,
+                &enabled_condition,
+                &prerequisite_keys,
+                &binding,
+            );
+            for trigger_key in physical_chord_keys {
+                hold_ups.insert(trigger_key);
+            }
+            continue;
+        }
+
         // A behavior that is exactly one repeat(...) becomes a hold-to-repeat. The loop
         // outlives the #HotIf press gate, so it re-checks focus (exe) and this profile's
         // enabled flag (id) itself each tick.
@@ -601,7 +625,11 @@ pub fn generate_combined_script(armed: &[ArmedProfile]) -> String {
         }
         // This handler is global so release recovery survives profile/focus changes. Always
         // pass the physical up through when no active owner suppressed its corresponding down.
-        release_up_lines.push_str(&format!("~*{key} up:: {{\n{actions}}}\n"));
+        // Ignore an output tap's synthetic up when the macro presses its own trigger button;
+        // the hook's physical state stays down until the user actually releases it.
+        release_up_lines.push_str(&format!(
+            "~*{key} up:: {{\n    if GetKeyState(\"{key}\", \"P\")\n        return\n{actions}}}\n"
+        ));
     }
 
     let header = format!(
@@ -1049,6 +1077,25 @@ fn parse_pure_hold(behavior: &str) -> Option<String> {
     Some(inner.to_string())
 }
 
+/// Whether a multi-step behavior contains a hold(...) action. Pure holds use the simpler remap
+/// path above; behaviors without a hold remain ordinary one-shot behaviors.
+fn has_compound_hold(behavior: &str) -> bool {
+    if !behavior.contains(';') {
+        return false;
+    }
+
+    behavior.split(';').any(|token| {
+        let token = token.trim();
+        let lower = token.to_lowercase();
+        if lower.starts_with("hold(") && token.ends_with(')') {
+            let inner = token[5..token.len() - 1].trim();
+            !inner.is_empty()
+        } else {
+            false
+        }
+    })
+}
+
 /// If `behavior` is exactly a single `repeat(<keys>, <interval_ms>)` action, return the
 /// key string (which may carry modifiers) and the interval. A multi-step behavior
 /// (containing `;`) is not treated as a hold-to-repeat.
@@ -1349,7 +1396,8 @@ SendBehaviorCommand(command, configuredExe) {
         SendOverlayCommand(command "?exe=" UriEncode(targetExe))
 }
 
-ExecuteBehavior(str, triggerModifiers := "", configuredExe := "") {
+ExecuteBehavior(str, triggerModifiers := "", configuredExe := "", holdOwner := "", preserveHooks := false) {
+    global chordHolds
     MouseGetPos &savedX, &savedY
     locked := false
     try {
@@ -1383,13 +1431,20 @@ ExecuteBehavior(str, triggerModifiers := "", configuredExe := "") {
                 MouseMove gameX + ResolveCoord(m[1], gameW), gameY + ResolveCoord(m[2], gameH), 0
             } else if RegExMatch(token, "i)^press\((.+)\)$", &m) {
                 for k in StrSplit(m[1], ",")
-                    DoPress(Trim(k), 30, false, false, triggerModifiers)
+                    DoPress(Trim(k), 30, false, preserveHooks, triggerModifiers)
                 Sleep 30
             } else if RegExMatch(token, "i)^repeat\((.+?),\s*(\d+)(?:,\s*\d+)?\)$", &m) {
-                DoPress(Trim(m[1]), 30, false, false, triggerModifiers)
+                DoPress(Trim(m[1]), 30, false, preserveHooks, triggerModifiers)
                 Sleep 30
             } else if RegExMatch(token, "i)^hold\((.+)\)$", &m) {
-                DoPress(Trim(m[1]), 30, false, false, triggerModifiers)
+                if (holdOwner = "") {
+                    DoPress(Trim(m[1]), 30, false, false, triggerModifiers)
+                } else {
+                    heldKeys := Trim(m[1])
+                    HoldKeyDown(heldKeys, triggerModifiers)
+                    state := chordHolds[holdOwner]
+                    state["keys"] := (state["keys"] = "") ? heldKeys : state["keys"] " " heldKeys
+                }
             } else if RegExMatch(token, "i)^state\((.+)\)$", &m) {
                 SendAppEvent("state_triggered", "", Trim(m[1]))
             } else if RegExMatch(token, "i)^sleep\((\d+)\)$", &m) {
@@ -1869,13 +1924,40 @@ HoldChordDown(owner, keyStr, chordKeys, triggerModifiers := "") {
     }
 }
 
+; Run a mixed behavior once per physical press while letting its hold(...) actions share the
+; normal trigger-owned release path. Register ownership before the first action so key-up and
+; hardware auto-repeat cannot race a behavior that is still executing.
+HoldBehaviorDown(owner, behavior, chordKeys, triggerModifiers := "", configuredExe := "") {
+    global chordHolds
+    previousCritical := Critical()
+    try {
+        if chordHolds.Has(owner)
+            return
+        chordHolds[owner] := Map(
+            "keys", "",
+            "chord", chordKeys,
+            "modifiers", triggerModifiers
+        )
+        ; Keep both input hooks installed while a preceding press(...) is emitted. SendEvent at
+        ; the hotkey's default input level cannot retrigger this script's hook hotkeys, and the
+        ; hook retains the trigger's physical-down state until its real release.
+        ExecuteBehavior(behavior, triggerModifiers, configuredExe, owner, true)
+    } catch Error as err {
+        HoldChordUp(owner)
+        throw err
+    } finally {
+        Critical previousCritical
+    }
+}
+
 HoldChordUp(owner) {
     global chordHolds
     if !chordHolds.Has(owner)
         return
     state := chordHolds[owner]
     chordHolds.Delete(owner)
-    HoldKeyUp(state["keys"], state["modifiers"])
+    if (state["keys"] != "")
+        HoldKeyUp(state["keys"], state["modifiers"])
 }
 
 ReleaseTriggerHolds(triggerKey) {
@@ -2221,6 +2303,37 @@ mod tests {
         ));
         assert!(script.contains("ReleaseTriggerHolds(triggerKey)"));
         assert!(!script.contains("CheckChordHoldReleases"));
+    }
+
+    #[test]
+    fn pressing_the_trigger_then_holding_another_button_waits_for_physical_trigger_up() {
+        let profile = profile_with_hotkey("XButton2", "press(XButton2);hold(RButton)");
+        let armed = [ArmedProfile {
+            siblings: std::slice::from_ref(&profile),
+            profile: &profile,
+            exe: "*",
+        }];
+        let script = generate_combined_script(&armed);
+        let trigger = &trigger_chord_keys("XButton2")[0];
+
+        assert!(script.contains(&format!(
+            "HoldBehaviorDown(\"test-profile:XButton2\", \"press(XButton2);hold(RButton)\", \"{trigger}\", \"\", \"*\")"
+        )));
+        assert!(script.contains(&format!(
+            "~*{trigger} up:: {{\n    if GetKeyState(\"{trigger}\", \"P\")\n        return\n    ReleaseTriggerHolds(\"{trigger}\")"
+        )));
+        assert!(script.contains(
+            "if chordHolds.Has(owner)\n            return\n        chordHolds[owner] := Map("
+        ));
+        assert!(script.contains(
+            "ExecuteBehavior(behavior, triggerModifiers, configuredExe, owner, true)"
+        ));
+        assert!(script.contains(
+            "DoPress(Trim(k), 30, false, preserveHooks, triggerModifiers)"
+        ));
+        assert!(script.contains(
+            "HoldKeyDown(heldKeys, triggerModifiers)\n                    state := chordHolds[holdOwner]"
+        ));
     }
 
     #[test]
