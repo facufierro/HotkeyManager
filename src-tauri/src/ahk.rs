@@ -824,6 +824,9 @@ global lastHealthTick := A_TickCount
 ReinstallHooks() {{
     InstallKeybdHook true, true
     InstallMouseHook true, true
+    ; If the old hook missed Copilot's key-up, its synthetic Ctrl belongs to that dead hook
+    ; generation. Release it now; a still-held Copilot key will reacquire Ctrl on key repeat.
+    ReleaseCopilotCtrl()
 }}
 
 OnMessage 0x218, OnPowerBroadcast  ; WM_POWERBROADCAST
@@ -885,15 +888,19 @@ SetTimer Heartbeat, 1000
 
 ; The Copilot key arrives as LWin+LShift+F23 (SC06E). Keep this remap in the same
 ; process as every other hotkey so there is one keyboard hook and one modifier-state owner.
-CopilotKeyPhysicallyDown() {{
-    ; Poll Windows directly instead of trusting hook state: this still detects release if the
-    ; low-level hook misses the F23 key-up while Windows is resuming or under load.
-    return (DllCall("GetAsyncKeyState", "Int", 0x86, "Short") & 0x8000) != 0
+; The remap and profile hotkeys intentionally share one keyboard hook. SendInput temporarily
+; removes that hook, so its RCtrl cannot act as a modifier for this script's own RCtrl hotkeys.
+; SendEvent at level 1 keeps the remapped key visible to the level-0 profile bindings and lets
+; the same hook forget Copilot's built-in LWin/LShift before matching the user's next key.
+SendCopilotKeys(keys) {{
+    previousSendLevel := SendLevel(1)
+    try SendEvent(keys)
+    finally SendLevel(previousSendLevel)
 }}
 
 ReleaseStaleCopilotModifiers() {{
-    if !GetKeyState("LCtrl", "P") && !CopilotKeyPhysicallyDown()
-        SendInput "{{Blind}}{{LCtrl up}}"
+    if !GetKeyState("RCtrl", "P")
+        SendCopilotKeys("{{Blind}}{{RCtrl up}}")
     if !GetKeyState("LWin", "P")
         SendInput "{{Blind}}{{LWin up}}"
     if !GetKeyState("LShift", "P")
@@ -905,22 +912,23 @@ ReleaseCopilotCtrl() {{
     if !copilotCtrlHeld
         return
     copilotCtrlHeld := false
-    ; Do not cancel a real Left Ctrl which happens to be held at the same time. Keep the
+    ; Do not cancel a real Right Ctrl which happens to be held at the same time. Keep the
     ; poll alive and clear our synthetic DownR immediately after the physical key is released.
-    if GetKeyState("LCtrl", "P") {{
+    if GetKeyState("RCtrl", "P") {{
         copilotCtrlReleasePending := true
+        SetTimer CheckCopilotRelease, 10
     }} else {{
         copilotCtrlReleasePending := false
         SetTimer CheckCopilotRelease, 0
-        SendInput "{{Blind}}{{LCtrl up}}"
+        SendCopilotKeys("{{Blind}}{{RCtrl up}}")
     }}
 }}
 
 ReleaseCopilotHeld(*) {{
     global copilotCtrlReleasePending, copilotShiftForwarded
     ReleaseCopilotCtrl()
-    if copilotCtrlReleasePending && !GetKeyState("LCtrl", "P")
-        SendInput "{{Blind}}{{LCtrl up}}"
+    if copilotCtrlReleasePending && !GetKeyState("RCtrl", "P")
+        SendCopilotKeys("{{Blind}}{{RCtrl up}}")
     copilotCtrlReleasePending := false
     copilotShiftForwarded := false
     if !GetKeyState("LWin", "P")
@@ -930,13 +938,15 @@ ReleaseCopilotHeld(*) {{
 }}
 
 CheckCopilotRelease(*) {{
-    global copilotCtrlHeld, copilotCtrlReleasePending
-    if copilotCtrlHeld && !CopilotKeyPhysicallyDown()
-        ReleaseCopilotCtrl()
-    if copilotCtrlReleasePending && !GetKeyState("LCtrl", "P") {{
+    global copilotCtrlReleasePending
+    if !copilotCtrlReleasePending {{
+        SetTimer CheckCopilotRelease, 0
+        return
+    }}
+    if copilotCtrlReleasePending && !GetKeyState("RCtrl", "P") {{
         copilotCtrlReleasePending := false
         SetTimer CheckCopilotRelease, 0
-        SendInput "{{Blind}}{{LCtrl up}}"
+        SendCopilotKeys("{{Blind}}{{RCtrl up}}")
     }}
 }}
 
@@ -1010,22 +1020,20 @@ $*LShift::{{
 $*SC06E::{{
     global copilotState, copilotShiftSuppressed, copilotShiftForwarded
     global copilotCtrlHeld, copilotCtrlReleasePending
-    modifiersForwarded := copilotState = "lwin_passed"
     SetTimer PassCopilotKeys, 0
     copilotState := "copilot"
     copilotShiftSuppressed := false
     SetTimer CheckCopilotShiftRelease, 0
-    if copilotShiftForwarded
-        SendInput "{{Blind}}{{LShift up}}"
     copilotShiftForwarded := false
-    if modifiersForwarded
-        SendInput "{{Blind}}{{LWin up}}"
     if copilotCtrlHeld
         return
     copilotCtrlHeld := true
     copilotCtrlReleasePending := false
-    SendInput "{{Blind}}{{LCtrl downR}}"
-    SetTimer CheckCopilotRelease, 10
+    SetTimer CheckCopilotRelease, 0
+    ; Copilot's own chord must not count as the user's Shift/Win modifiers. Clearing them and
+    ; pressing RCtrl in one hook-visible batch makes Copilot+O match RCtrl+O, while a real Shift
+    ; pressed afterward still makes Copilot+Shift+O match RCtrl+Shift+O.
+    SendCopilotKeys("{{Blind}}{{LShift up}}{{LWin up}}{{RCtrl downR}}")
 }}
 
 $*SC06E up::{{
@@ -2386,10 +2394,24 @@ mod tests {
         let script = generate_combined_script(&[]);
 
         assert!(script.contains("$*SC06E::"));
-        assert!(script.contains("SendInput \"{Blind}{LCtrl downR}\""));
-        assert!(!script.contains("SendInput \"{Blind}{RCtrl downR}\""));
-        assert!(script.contains("SetTimer CheckCopilotRelease, 10"));
-        assert!(script.contains("GetAsyncKeyState"));
+        assert!(script.contains(
+            "SendCopilotKeys(\"{Blind}{LShift up}{LWin up}{RCtrl downR}\")"
+        ));
+        assert!(!script.contains("SendCopilotKeys(\"{Blind}{LCtrl downR}\")"));
+        assert!(script.contains(
+            "previousSendLevel := SendLevel(1)\n    try SendEvent(keys)\n    finally SendLevel(previousSendLevel)"
+        ));
+        assert!(script.contains(
+            "copilotCtrlReleasePending := true\n        SetTimer CheckCopilotRelease, 10"
+        ));
+        assert!(script.contains(
+            "if !copilotCtrlReleasePending {\n        SetTimer CheckCopilotRelease, 0\n        return"
+        ));
+        assert!(!script.contains("CopilotKeyPhysicallyDown"));
+        assert!(!script.contains("copilotCtrlHeld && !"));
+        assert!(script.contains(
+            "InstallMouseHook true, true\n    ; If the old hook missed Copilot's key-up"
+        ));
         assert!(script.contains("#HotIf copilotState = \"waiting\"\n$*LShift::"));
         assert_eq!(script.matches("$*LShift::").count(), 1);
         assert!(!script.contains("$*LShift up::"));
