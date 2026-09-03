@@ -2,6 +2,35 @@
 
 These instructions apply to the entire repository.
 
+## Copilot key remap invariants
+
+The Copilot key is not a standalone key: on the target Windows hardware it arrives as the
+compound `LWin+LShift+F23` sequence (`SC06E` is F23). MacroToolbox's always-on remap must make
+that physical button behave as a true held **Right Ctrl**, never Left Ctrl or generic Ctrl.
+
+Whenever changing AutoHotkey generation, keyboard hooks, modifier handling, input ownership,
+hotkey matching, or release recovery, preserve all of these invariants:
+
+- Neutralize the Copilot chord's built-in Left Win and Left Shift before matching or forwarding
+  the user's next key. Those synthetic chord modifiers must not leak into applications or make
+  an unshifted shortcut look shifted.
+- Hold Right Ctrl continuously from the Copilot F23/`SC06E` down event until its corresponding
+  up event. Do not infer Copilot release by polling F23 with `GetAsyncKeyState`; Windows does not
+  reliably expose the synthesized Copilot F23 as physically held, and polling can release Ctrl
+  immediately after it is pressed.
+- The Copilot remap and generated profile hotkeys share one AutoHotkey keyboard hook. Emit the
+  remapped transitions through that hook (currently `SendEvent` at a higher send level), so the
+  synthetic Right Ctrl works both in external applications and as a modifier for MacroToolbox's
+  own configured `rctrl ...` hotkeys. `SendInput` temporarily removes the script's own hook and
+  must not be used for these remapped transitions.
+- Preserve independently held physical Right Ctrl, Left Win, and Shift keys. Recovery for a
+  missed Copilot key-up belongs to hook reinstallation and process-exit cleanup; it must not
+  shorten a normal held remap or leave Ctrl stuck.
+- Add or update regression coverage whenever this seam changes. At minimum protect:
+  `Copilot+Shift+N` behaving as `RCtrl+Shift+N` in an external application; configured
+  `rctrl o -> send(ø)` and `rctrl shift o -> send(Ø)` remaining distinct; press/hold/release not
+  repeating or sticking Right Ctrl; and ordinary Win/Shift input continuing to work.
+
 ## Changelogs are required for every user-facing change
 
 Releases are cut by `scripts/package-release.ps1` and `.github/workflows/release.yml`.
