@@ -342,6 +342,15 @@ fn generate_profile_block(
         if !keyset.insert(binding_id) { continue; }
         let trigger = escape_ahk_string(&hk.trigger);
         let trigger_modifiers = trigger_modifier_symbols(&hk.trigger);
+        // Unmodified held remaps must still activate while an unrelated modifier is held.
+        // Keep explicit modifier chords exact so shifted and unshifted shortcuts stay distinct.
+        let ahk_key = if trigger_modifiers.is_empty()
+            && (parse_pure_hold(&hk.behavior).is_some() || has_compound_hold(&hk.behavior))
+        {
+            format!("$*{}", ahk_key.trim_start_matches('$'))
+        } else {
+            ahk_key
+        };
         // The overlay only reacts to a hotkey_triggered ping for a binding that carries a
         // state_id (it drives overlay state flags/timers). For every other hotkey the ping is
         // a wasted blocking localhost round-trip on the hotkey's own thread — its first-call
@@ -2251,6 +2260,41 @@ mod tests {
             "RepeatHold(\"f5\", 100, \"F4\", \"xbutton1 F4\", \"\", 6, \"test-profile\", true, \"\")"
         ));
         assert!(script.contains("TriggerChordPhysicallyDown(triggerChord, useWindowsState)"));
+    }
+
+    #[test]
+    fn unmodified_hold_macros_accept_and_preserve_unrelated_modifiers() {
+        for behavior in ["hold(XButton1 LButton)", "press(XButton1);hold(LButton)"] {
+            let mut profile = profile_with_hotkey("XButton1", behavior);
+            for trigger in ["shift XButton1", "rctrl o", "rctrl shift o"] {
+                profile.hotkeys.push(Hotkey {
+                    name: String::new(),
+                    trigger: trigger.to_string(),
+                    behavior: "hold(F5)".to_string(),
+                    state_id: None,
+                });
+            }
+            let armed = [ArmedProfile {
+                siblings: std::slice::from_ref(&profile),
+                profile: &profile,
+                exe: "Game.exe",
+            }];
+            let script = generate_combined_script(&armed);
+
+            assert!(script.contains("$*xbutton1:: {\n    Hold"));
+            assert!(script.contains("\"xbutton1\", \"\""));
+            assert!(script.contains("$+xbutton1:: {\n    HoldChordDown"));
+            for trigger in ["rctrl o", "rctrl shift o"] {
+                assert!(script.contains(&format!("{}:: {{", trigger_to_key(trigger))));
+                assert!(!trigger_to_key(trigger).contains('*'));
+            }
+            assert!(script.contains("~*xbutton1 up:: {"));
+            assert!(script.contains("ReleaseTriggerHolds(\"xbutton1\")"));
+            assert!(script.contains("blind := BlindFor(triggerModifiers, KeyModifierSymbols(keyStr))"));
+            assert!(script.contains("return \"{Blind\" triggerModifiers \"}\""));
+            assert!(script.contains("SendOwnedKeyDown(keyName, true, \"DownR\", blind)"));
+            assert!(script.contains("if chordHolds.Has(owner)\n            return"));
+        }
     }
 
     #[test]
