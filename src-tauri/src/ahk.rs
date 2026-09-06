@@ -882,18 +882,6 @@ CheckRepeatReleases(*) {{
 ; Clear only keys which are not physically held, so startup cannot cancel real input.
 ReleaseStaleCopilotModifiers()
 
-; --- TEMP DIAGNOSTIC: liveness heartbeat, logged next to this script (ahk-heartbeat.log).
-; Consecutive lines whose A_TickCount differs by far more than 1000 mean Windows froze or
-; throttled this process while it was idle in the tray; a "started" line partway through the
-; file means the process was killed and relaunched. Lets us tell a frozen process apart from an
-; alive-but-hook-dead one. Remove once the tray-idle latency is pinned down.
-global heartbeatLog := A_ScriptDir "\ahk-heartbeat.log"
-try FileAppend "=== started A_Now=" A_Now " tick=" A_TickCount "`n", heartbeatLog
-Heartbeat() {{
-    global heartbeatLog
-    try FileAppend A_TickCount " " A_Now "`n", heartbeatLog
-}}
-SetTimer Heartbeat, 1000
 
 ; The Copilot key arrives as LWin+LShift+F23 (SC06E). Keep this remap in the same
 ; process as every other hotkey so there is one keyboard hook and one modifier-state owner.
@@ -1457,10 +1445,7 @@ ExecuteBehavior(str, triggerModifiers := "", configuredExe := "", holdOwner := "
                 if (holdOwner = "") {
                     DoPress(Trim(m[1]), 30, false, false, triggerModifiers)
                 } else {
-                    heldKeys := Trim(m[1])
-                    HoldKeyDown(heldKeys, triggerModifiers)
-                    state := chordHolds[holdOwner]
-                    state["keys"] := (state["keys"] = "") ? heldKeys : state["keys"] " " heldKeys
+                    HoldBehaviorKey(holdOwner, Trim(m[1]), triggerModifiers)
                 }
             } else if RegExMatch(token, "i)^state\((.+)\)$", &m) {
                 SendAppEvent("state_triggered", "", Trim(m[1]))
@@ -1856,12 +1841,16 @@ TriggerChordHeld(chordKeys) {
 ;   - Each physical trigger owns one output reference. Hardware auto-repeat is ignored so a held
 ;     output remains one uninterrupted down rather than repeating while the trigger stays held.
 ; Global key-up handlers release owners independently of profile enabled/focus conditions.
-HoldKeyDown(keyStr, triggerModifiers := "") {
+HoldKeyDown(owner, keyStr, triggerModifiers := "") {
+    global chordHolds
     SetKeyDelay -1, -1
     SetMouseDelay -1
     blind := BlindFor(triggerModifiers, KeyModifierSymbols(keyStr))
     keys := HoldKeyList(keyStr)
+    state := chordHolds[owner]
     for index, keyName in keys {
+        ; Track each acquisition before its send can fail; later keys remain unowned.
+        state["keys"] := (state["keys"] = "") ? keyName : state["keys"] " " keyName
         AcquireHeldOutput(keyName, blind)
         ; Preserve the configured order as distinct transitions: the first output remains down
         ; before the next one is pressed. Some games miss simultaneous synthetic mouse downs.
@@ -1931,19 +1920,21 @@ HoldChordDown(owner, keyStr, chordKeys, triggerModifiers := "") {
         if chordHolds.Has(owner)
             return
         chordHolds[owner] := Map(
-            "keys", keyStr,
+            "keys", "",
             "chord", chordKeys,
             "modifiers", triggerModifiers
         )
-        HoldKeyDown(keyStr, triggerModifiers)
+        HoldKeyDown(owner, keyStr, triggerModifiers)
+    } catch Error as err {
+        HoldChordUp(owner)
+        throw err
     } finally {
         Critical previousCritical
     }
 }
 
-; Run a mixed behavior once per physical press while letting its hold(...) actions share the
-; normal trigger-owned release path. Register ownership before the first action so key-up and
-; hardware auto-repeat cannot race a behavior that is still executing.
+; Register before the first step so a release during the prefix also ends ownership. Only
+; registration is critical: the release hotkey must be able to interrupt a waiting hold step.
 HoldBehaviorDown(owner, behavior, chordKeys, triggerModifiers := "", configuredExe := "") {
     global chordHolds
     previousCritical := Critical()
@@ -1955,16 +1946,35 @@ HoldBehaviorDown(owner, behavior, chordKeys, triggerModifiers := "", configuredE
             "chord", chordKeys,
             "modifiers", triggerModifiers
         )
+    } finally {
+        Critical previousCritical
+    }
+    try {
         ; Keep both input hooks installed while a preceding press(...) is emitted. SendEvent at
         ; the hotkey's default input level cannot retrigger this script's hook hotkeys, and the
         ; hook retains the trigger's physical-down state until its real release.
         ExecuteBehavior(behavior, triggerModifiers, configuredExe, owner, true)
-    } catch Error as err {
+    } finally {
         HoldChordUp(owner)
-        throw err
+    }
+}
+
+; A sequence resumes after the trigger's release handler has released its held outputs.
+; Observe ownership, not synthesized key state, so mouse triggers and held chords use the
+; same release event as standalone remaps. A trigger released during an earlier step cannot
+; acquire a new hold afterward.
+HoldBehaviorKey(owner, keyStr, triggerModifiers := "") {
+    global chordHolds
+    previousCritical := Critical()
+    try {
+        if !chordHolds.Has(owner)
+            return
+        HoldKeyDown(owner, keyStr, triggerModifiers)
     } finally {
         Critical previousCritical
     }
+    while chordHolds.Has(owner)
+        Sleep 10
 }
 
 HoldChordUp(owner) {
@@ -2384,7 +2394,7 @@ mod tests {
             "DoPress(Trim(k), 30, false, preserveHooks, triggerModifiers)"
         ));
         assert!(script.contains(
-            "HoldKeyDown(heldKeys, triggerModifiers)\n                    state := chordHolds[holdOwner]"
+            "HoldBehaviorKey(holdOwner, Trim(m[1]), triggerModifiers)"
         ));
     }
 
